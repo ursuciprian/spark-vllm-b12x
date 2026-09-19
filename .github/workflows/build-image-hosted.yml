@@ -1,0 +1,181 @@
+name: build-image-hosted
+
+# Feasibility build on GitHub-hosted free arm64 runners (ubuntu-24.04-arm:
+# 4 vCPU / 16GB RAM / ~14GB free disk / 6h per job). Staged into three jobs
+# so each fits under the 6h cap and reuses ghcr.io registry cache across runs.
+# Never touches dgx-01 or the self-hosted workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_ref:
+        description: "vLLM fork ref to build"
+        required: false
+        default: "dgx-spark"
+      b12x_ref:
+        description: "b12x fork ref to build"
+        required: false
+        default: "dgx-spark"
+      push:
+        description: "Push the built image to ghcr.io (otherwise cache-only, no image kept)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-image-hosted
+  cancel-in-progress: false
+
+env:
+  CACHE_REPO: ghcr.io/${{ github.repository }}/cache
+
+jobs:
+  flashinfer-wheel:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/free-disk
+      - run: nproc; free -g
+      - run: docker buildx create --use --name hostedbuilder --driver docker-container
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build flashinfer wheels
+        run: |
+          mkdir -p "${{ github.workspace }}/wheels/flashinfer"
+          bash ci/build-stage.sh flashinfer-export \
+            --build-arg "BUILD_JOBS=4" \
+            --cache-from "type=registry,ref=${CACHE_REPO}:flashinfer" \
+            --cache-to "type=registry,ref=${CACHE_REPO}:flashinfer,mode=max" \
+            --output "type=local,dest=${{ github.workspace }}/wheels/flashinfer"
+      - run: df -h /; free -g; ls -la wheels/flashinfer
+      - run: docker logout ghcr.io
+        if: always()
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flashinfer-wheels
+          path: wheels/flashinfer
+          retention-days: 3
+
+  vllm-wheel:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/free-disk
+      - run: nproc; free -g
+      - run: docker buildx create --use --name hostedbuilder --driver docker-container
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Clone vLLM fork and apply carried patches
+        env:
+          VLLM_REF: ${{ github.event.inputs.vllm_ref || 'dgx-spark' }}
+        run: |
+          git clone --depth 1 --branch "$VLLM_REF" https://github.com/ursuciprian/vllm.git /tmp/vllm-src
+          shopt -s nullglob
+          for p in patches/vllm-*.patch; do
+            echo "applying $p"
+            git -C /tmp/vllm-src apply --check "$p"
+            git -C /tmp/vllm-src apply "$p"
+          done
+          shopt -u nullglob
+          if [ -n "$(git -C /tmp/vllm-src status --porcelain)" ]; then
+            git -C /tmp/vllm-src -c user.email=ci@localhost -c user.name=ci commit -aqm "ci: carried source patches (build-stage-hosted)"
+          fi
+          echo "VLLM_SOURCE_COMMIT=$(git -C /tmp/vllm-src rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Build vllm wheels
+        run: |
+          mkdir -p "${{ github.workspace }}/wheels/vllm"
+          bash ci/build-stage.sh vllm-export \
+            --build-arg "BUILD_JOBS=4" \
+            --build-arg "TORCH_VERSION=2.13.0" \
+            --build-arg "TORCHVISION_VERSION=0.28.0" \
+            --build-arg "TORCHAUDIO_VERSION=2.11.0" \
+            --build-arg "VLLM_SOURCE_MODE=local" \
+            --build-arg "VLLM_SOURCE_COMMIT=${VLLM_SOURCE_COMMIT}" \
+            --build-arg "VLLM_APPLY_PRESET_PRS=0" \
+            --build-arg "VLLM_PRESERVE_SM12X_TARGET=1" \
+            --build-arg "VLLM_PATCH_B12X_C128A_ALIGNMENT=1" \
+            --build-context "vllm_source=/tmp/vllm-src" \
+            --cache-from "type=registry,ref=${CACHE_REPO}:vllm" \
+            --cache-to "type=registry,ref=${CACHE_REPO}:vllm,mode=max" \
+            --output "type=local,dest=${{ github.workspace }}/wheels/vllm"
+      - run: df -h /; free -g; ls -la wheels/vllm
+      - run: docker logout ghcr.io
+        if: always()
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vllm-wheels
+          path: wheels/vllm
+          retention-days: 3
+
+  image:
+    needs: [flashinfer-wheel, vllm-wheel]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/free-disk
+      - run: nproc; free -g
+      - run: docker buildx create --use --name hostedbuilder --driver docker-container
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: flashinfer-wheels
+          path: wheels/flashinfer
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: vllm-wheels
+          path: wheels/vllm
+      - name: Resolve tags and placeholder draft-vocab context
+        env:
+          B12X_REF: ${{ github.event.inputs.b12x_ref || 'dgx-spark' }}
+        run: |
+          # ponytail: real MTP draft-vocab weights (draft_vocab_mia47k.pt) live
+          # only on dgx-01 and are inert unless VLLM_QWEN_MTP_DRAFT_VOCAB_PATH
+          # is set at serve time -- an empty placeholder satisfies the
+          # Dockerfile's COPY --from=draft_vocab for this feasibility build.
+          # Add a real artifact fetch here if the hosted image ever needs to
+          # serve MTP with the reduced draft vocab.
+          mkdir -p /tmp/draft-vocab
+          : > /tmp/draft-vocab/draft_vocab_mia47k.pt
+
+          git clone --depth 1 --branch "$B12X_REF" https://github.com/ursuciprian/b12x.git /tmp/b12x-src
+          echo "B12X_SHORT_SHA=$(git -C /tmp/b12x-src rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+          echo "VLLM_SHORT_SHA=$(cut -c1-8 wheels/vllm/.vllm-commit)" >> "$GITHUB_ENV"
+      - name: Build final image
+        env:
+          PUSH: ${{ github.event.inputs.push }}
+          B12X_REF: ${{ github.event.inputs.b12x_ref || 'dgx-spark' }}
+        run: |
+          OUT_ARGS=(--output type=cacheonly)
+          if [ "$PUSH" = "true" ]; then
+            OUT_ARGS=(--push -t "ghcr.io/${{ github.repository_owner }}/spark-vllm-b12x:${VLLM_SHORT_SHA}-${B12X_SHORT_SHA}-hosted")
+          fi
+          bash ci/build-stage.sh runner \
+            --build-arg "BUILD_JOBS=4" \
+            --build-arg "TORCH_VERSION=2.13.0" \
+            --build-arg "TORCHVISION_VERSION=0.28.0" \
+            --build-arg "TORCHAUDIO_VERSION=2.11.0" \
+            --build-arg "B12X_REPO=https://github.com/ursuciprian/b12x.git" \
+            --build-arg "B12X_REF=${B12X_REF}" \
+            --build-arg "B12X_CACHEBUST=$(date +%Y%m%d)" \
+            --build-context "flashinfer_wheels=${{ github.workspace }}/wheels/flashinfer" \
+            --build-context "vllm_wheels=${{ github.workspace }}/wheels/vllm" \
+            --build-context "draft_vocab=/tmp/draft-vocab" \
+            --cache-from "type=registry,ref=${CACHE_REPO}:image" \
+            --cache-to "type=registry,ref=${CACHE_REPO}:image,mode=max" \
+            "${OUT_ARGS[@]}"
+      - run: df -h /; free -g
+      - run: docker logout ghcr.io
+        if: always()
