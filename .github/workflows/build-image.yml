@@ -1,0 +1,76 @@
+name: build-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_ref:
+        description: "vLLM fork ref to build (default: dgx-spark)"
+        required: false
+        default: "dgx-spark"
+      b12x_ref:
+        description: "b12x fork ref to build (default: dgx-spark)"
+        required: false
+        default: "dgx-spark"
+      push:
+        description: "Push the built image to ghcr.io"
+        type: boolean
+        required: false
+        default: false
+      allow_while_serving:
+        description: "Allow building even if the runner host is currently serving a model"
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, dgx-spark]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight - refuse to build while serving
+        env:
+          ALLOW_WHILE_SERVING: ${{ github.event.inputs.allow_while_serving }}
+        run: |
+          if curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health | grep -q '^200$'; then
+            if [ "$ALLOW_WHILE_SERVING" != "true" ]; then
+              echo "::error::localhost:8000/health returned 200 (a model appears to be serving on this runner)." >&2
+              echo "Refusing to start a >1h high-RAM/CPU/disk build. Re-run with allow_while_serving=true if this is intentional." >&2
+              exit 1
+            fi
+            echo "allow_while_serving=true: proceeding despite an active health check."
+          else
+            echo "No server detected on localhost:8000; safe to build."
+          fi
+
+      - name: Docker login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build
+        env:
+          VLLM_REF: ${{ github.event.inputs.vllm_ref || 'dgx-spark' }}
+          B12X_REF: ${{ github.event.inputs.b12x_ref || 'dgx-spark' }}
+          PUSH_INPUT: ${{ github.event.inputs.push }}
+          CONFIRM_BUILD: "1"
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          args=()
+          if [ "$PUSH_INPUT" != "false" ]; then
+            args+=(--push)
+          fi
+          bash build.sh "${args[@]}"
+
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io
