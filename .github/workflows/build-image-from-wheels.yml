@@ -1,0 +1,71 @@
+name: build-image-from-wheels
+
+# Assemble the spark-vllm-b12x runtime image from wheels published by
+# wheels-release.yml, without recompiling. Runs on the free hosted arm64
+# runner by default (fast: just downloads wheels + docker build the runner
+# stage), with an option to run on dgx-01 for comparison.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wheels_tag:
+        description: "Release tag from wheels-release.yml to assemble from"
+        required: true
+      push:
+        description: "Push the built image to ghcr.io"
+        type: boolean
+        required: false
+        default: true
+      runner:
+        description: "Where to run the assembly build"
+        type: choice
+        options:
+          - hosted
+          - dgx-01
+        default: hosted
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: build-image-from-wheels
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ${{ inputs.runner == 'dgx-01' && fromJSON('["self-hosted", "dgx-spark"]') || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/free-disk
+        if: ${{ inputs.runner != 'dgx-01' }}
+
+      - name: Docker login (ghcr.io)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build from wheels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WHEELS_TAG: ${{ inputs.wheels_tag }}
+          OWNER: ${{ github.repository_owner }}
+          PUSH_INPUT: ${{ inputs.push }}
+        run: |
+          args=(--use-wheels "$WHEELS_TAG")
+          if [ "$PUSH_INPUT" = "true" ]; then
+            args+=(--push)
+          fi
+          bash build.sh "${args[@]}"
+
+      - name: Print image digest
+        env:
+          WHEELS_TAG: ${{ inputs.wheels_tag }}
+        run: |
+          docker image inspect --format '{{.RepoTags}} {{index .RepoDigests 0}}' \
+            "ghcr.io/${{ github.repository_owner }}/spark-vllm-b12x:${WHEELS_TAG}" 2>/dev/null || \
+            echo "digest unavailable locally (image was pushed, not kept)"
+
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io

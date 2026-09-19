@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# ci/wheels_release/build_bundle.sh
+#
+# Compile-once orchestrator for the wheels-release workflow: builds the
+# flashinfer wheel, the vllm wheel and the b12x wheel on dgx-01 (self-hosted,
+# real GPU), reuses build.sh's existing wheel-cache dirs so a second run for
+# the same source commit is a no-op, bundles each as
+# "<name>-cu134-<sha7>.tar.zst" + ".sha256", writes build-metadata.yaml, and
+# publishes (or verifies-and-skips) a GitHub release.
+#
+# Env (all required unless noted):
+#   VLLM_REF, B12X_REF, FLASHINFER_REF (informational; flashinfer wheel is
+#     built from eugr's pinned Dockerfile stage, not a standalone flashinfer
+#     checkout -- FLASHINFER_REF is recorded in metadata only)
+#   TAG                 -- release tag to create/verify
+#   REPO                -- "owner/name" for `gh release`
+#   BUILD_ROOT          -- default $HOME/GEN-AI/build (shares build.sh's wheel-cache)
+#   GH_TOKEN            -- must be exported by the caller for `gh`
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BUILD_ROOT="${BUILD_ROOT:-$HOME/GEN-AI/build}"
+VLLM_REPO="${VLLM_REPO:-https://github.com/ursuciprian/vllm.git}"
+VLLM_REF="${VLLM_REF:?VLLM_REF required}"
+B12X_REPO="${B12X_REPO:-https://github.com/ursuciprian/b12x.git}"
+B12X_REF="${B12X_REF:?B12X_REF required}"
+FLASHINFER_REF="${FLASHINFER_REF:-}"
+TAG="${TAG:?TAG required}"
+REPO="${REPO:?REPO required, e.g. ursuciprian/spark-vllm-b12x}"
+SPARK_VLLM_DOCKER_REPO="${SPARK_VLLM_DOCKER_REPO:-https://github.com/eugr/spark-vllm-docker.git}"
+SPARK_VLLM_DOCKER_REF="${SPARK_VLLM_DOCKER_REF:-798528a2}"
+
+OUT_DIR="$(mktemp -d)/wheels-release"
+mkdir -p "$OUT_DIR"
+echo "== staging bundle in $OUT_DIR =="
+
+echo "== 1. fresh scratch copy of eugr/spark-vllm-docker (patched), for the export stages =="
+WORKDIR="$BUILD_ROOT/spark-vllm-docker"
+rm -rf "$WORKDIR"
+git clone --quiet "$SPARK_VLLM_DOCKER_REPO" "$WORKDIR"
+git -C "$WORKDIR" checkout --quiet "$SPARK_VLLM_DOCKER_REF"
+python3 "$REPO_ROOT/apply_submodule_fix.py" "$WORKDIR/Dockerfile"
+DOCKERFILE_SHA="$(sha256sum "$WORKDIR/Dockerfile" | awk '{print $1}')"
+
+echo "== 2. vllm source: clone, pin, apply patches (same as build.sh) =="
+VLLM_SRC="$BUILD_ROOT/.src/vllm"
+mkdir -p "$(dirname "$VLLM_SRC")"
+[ -d "$VLLM_SRC/.git" ] || git clone --quiet "$VLLM_REPO" "$VLLM_SRC"
+git -C "$VLLM_SRC" fetch --quiet origin "$VLLM_REF"
+git -C "$VLLM_SRC" checkout --quiet FETCH_HEAD
+shopt -s nullglob
+for p in "$REPO_ROOT"/patches/vllm-*.patch; do
+    git -C "$VLLM_SRC" apply --check "$p" && git -C "$VLLM_SRC" apply "$p"
+done
+shopt -u nullglob
+if [ -n "$(git -C "$VLLM_SRC" status --porcelain)" ]; then
+    git -C "$VLLM_SRC" -c user.email=ci@localhost -c user.name=ci commit -aqm "ci: carried source patches (wheels-release)"
+fi
+VLLM_SOURCE_COMMIT="$(git -C "$VLLM_SRC" rev-parse HEAD)"
+VLLM_SHORT_SHA="$(git -C "$VLLM_SRC" rev-parse --short=7 HEAD)"
+
+echo "== 3. flashinfer wheel export (reuse build.sh's wheel-cache if present) =="
+FI_DIR="$BUILD_ROOT/.wheel-cache/flashinfer"
+if compgen -G "$FI_DIR"/flashinfer*.whl > /dev/null 2>&1; then
+    echo "flashinfer wheel cache hit: $FI_DIR"
+else
+    mkdir -p "$FI_DIR"
+    ( cd "$WORKDIR" && docker build --target flashinfer-export --output "type=local,dest=$FI_DIR" -f Dockerfile . )
+fi
+
+echo "== 4. vllm wheel export (reuse cache if commit matches) =="
+VW_DIR="$BUILD_ROOT/.wheel-cache/vllm"
+if compgen -G "$VW_DIR"/vllm-*.whl > /dev/null 2>&1 && [ "$(cat "$VW_DIR/.vllm-source-commit" 2>/dev/null)" = "$VLLM_SOURCE_COMMIT" ]; then
+    echo "vllm wheel cache hit for $VLLM_SOURCE_COMMIT: $VW_DIR"
+else
+    rm -rf "$VW_DIR"; mkdir -p "$VW_DIR"
+    ( cd "$WORKDIR" && docker build --target vllm-export --output "type=local,dest=$VW_DIR" \
+        --build-arg "TORCH_VERSION=2.13.0" \
+        --build-arg "TORCHVISION_VERSION=0.28.0" \
+        --build-arg "TORCHAUDIO_VERSION=2.11.0" \
+        --build-arg "VLLM_SOURCE_MODE=local" \
+        --build-arg "VLLM_SOURCE_COMMIT=${VLLM_SOURCE_COMMIT}" \
+        --build-arg "VLLM_APPLY_PRESET_PRS=0" \
+        --build-arg "VLLM_PRESERVE_SM12X_TARGET=1" \
+        --build-arg "VLLM_PATCH_B12X_C128A_ALIGNMENT=1" \
+        --build-context "vllm_source=${VLLM_SRC}" \
+        -f Dockerfile . )
+    echo "$VLLM_SOURCE_COMMIT" > "$VW_DIR/.vllm-source-commit"
+fi
+
+echo "== 5. b12x wheel: pure 'pip wheel', JIT-compiled kernels so no CUDA toolchain build needed (see ci/lil_wheels pattern) =="
+B12X_SRC="$BUILD_ROOT/.src/b12x-wheel"
+rm -rf "$B12X_SRC"
+git clone --quiet "$B12X_REPO" "$B12X_SRC"
+git -C "$B12X_SRC" fetch --quiet origin "$B12X_REF"
+git -C "$B12X_SRC" checkout --quiet FETCH_HEAD
+B12X_COMMIT="$(git -C "$B12X_SRC" rev-parse HEAD)"
+B12X_SHORT_SHA="$(git -C "$B12X_SRC" rev-parse --short=7 HEAD)"
+
+BASE_IMAGE="$(grep -m1 '^FROM .* AS runner' "$WORKDIR/Dockerfile" | awk '{print $2}')"
+B12X_WHEEL_DIR="$BUILD_ROOT/.wheel-cache/b12x"
+rm -rf "$B12X_WHEEL_DIR"; mkdir -p "$B12X_WHEEL_DIR"
+docker run --rm \
+    -v "$B12X_SRC:/src:ro" \
+    -v "$B12X_WHEEL_DIR:/wheelhouse" \
+    -w /src \
+    "$BASE_IMAGE" \
+    bash -lc 'python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
+echo "$B12X_COMMIT" > "$B12X_WHEEL_DIR/.b12x-source-commit"
+
+echo "== 6. bundle each wheel dir as <name>-cu134-<sha7>.tar.zst + .sha256 =="
+bundle() {
+    local name="$1" src_dir="$2" sha7="$3"
+    local archive="$OUT_DIR/${name}-cu134-${sha7}.tar.zst"
+    tar --sort=name --owner=0 --group=0 --numeric-owner --zstd -C "$src_dir" -cf "$archive" $(cd "$src_dir" && find . -maxdepth 1 -name '*.whl' -printf '%P\n')
+    sha256sum "$archive" | awk -v a="$(basename "$archive")" '{print $1"  "a}' > "$archive.sha256"
+    echo "wrote $archive"
+}
+FI_SHORT_SHA="${FLASHINFER_REF:-unpinned}"
+FI_SHORT_SHA="$(echo "$FI_SHORT_SHA" | cut -c1-7)"
+[ -z "$FI_SHORT_SHA" ] && FI_SHORT_SHA="bundled"
+bundle flashinfer "$FI_DIR" "$FI_SHORT_SHA"
+bundle vllm "$VW_DIR" "$VLLM_SHORT_SHA"
+bundle b12x "$B12X_WHEEL_DIR" "$B12X_SHORT_SHA"
+
+echo "== 7. build-metadata.yaml =="
+cat > "$OUT_DIR/build-metadata.yaml" <<EOF
+build_date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+build_script_commit: ci/wheels_release/build_bundle.sh
+tag: ${TAG}
+dockerfile_sha256: ${DOCKERFILE_SHA}
+spark_vllm_docker_repo: ${SPARK_VLLM_DOCKER_REPO}
+spark_vllm_docker_ref: ${SPARK_VLLM_DOCKER_REF}
+torch_version: "2.13.0"
+torchvision_version: "0.28.0"
+torchaudio_version: "2.11.0"
+vllm:
+  repo: ${VLLM_REPO}
+  ref: ${VLLM_REF}
+  source_commit: ${VLLM_SOURCE_COMMIT}
+b12x:
+  repo: ${B12X_REPO}
+  ref: ${B12X_REF}
+  source_commit: ${B12X_COMMIT}
+flashinfer:
+  ref: ${FLASHINFER_REF}
+EOF
+
+echo "== 8. self-verify freshly built bundle =="
+python3 "$REPO_ROOT/ci/wheels_release/verify_release_assets.py" --directory "$OUT_DIR"
+
+echo "== 9. publish (or verify-and-skip if the tag already exists) =="
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    echo "release $TAG already exists on $REPO -- downloading to verify byte-identical assets"
+    EXISTING_DIR="$(mktemp -d)"
+    gh release download "$TAG" --repo "$REPO" --dir "$EXISTING_DIR"
+    python3 "$REPO_ROOT/ci/wheels_release/verify_release_assets.py" --directory "$OUT_DIR" --reference-directory "$EXISTING_DIR"
+    echo "existing release $TAG matches freshly built assets byte-for-byte; not re-publishing."
+else
+    gh release create "$TAG" --repo "$REPO" --prerelease \
+        --title "spark-vllm-b12x wheels ${TAG}" \
+        --notes "vllm ${VLLM_SHORT_SHA} / b12x ${B12X_SHORT_SHA} / flashinfer ${FI_SHORT_SHA}. See build-metadata.yaml for full pins." \
+        "$OUT_DIR"/*.tar.zst "$OUT_DIR"/*.sha256 "$OUT_DIR/build-metadata.yaml"
+    echo "published release $TAG on $REPO"
+fi
+
+echo "OUT_DIR=$OUT_DIR"
