@@ -80,7 +80,10 @@ jobs:
         run: |
           git clone --depth 1 --branch "$VLLM_REF" https://github.com/ursuciprian/vllm.git /tmp/vllm-src
           shopt -s nullglob
-          for p in patches/vllm-*.patch; do
+          # git -C resolves relative paths against ITS target dir, not the
+          # original cwd, so the patch path must be absolute (build.sh hits
+          # the same gotcha and works around it via an absolute PATCH_DIR).
+          for p in "${{ github.workspace }}/patches"/vllm-*.patch; do
             echo "applying $p"
             git -C /tmp/vllm-src apply --check "$p"
             git -C /tmp/vllm-src apply "$p"
