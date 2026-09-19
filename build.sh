@@ -17,6 +17,14 @@
 #   SPARK_VLLM_DOCKER_REF     -- pinned commit (default: 798528a2, 2026-09-16)
 #   DISTRIBUTE_TO             -- if set, ssh host to docker save|ssh|load the image onto
 #   OWNER                     -- ghcr.io namespace for --push (default: ursuciprian)
+#   DRAFT_VOCAB_DIR           -- dir containing the real draft_vocab_mia47k.pt
+#                                (AGPL) for a local serving build with MTP
+#                                enabled, e.g. $BUILD_ROOT/draft-vocab on
+#                                dgx-01. Ignored (and an empty placeholder
+#                                used instead) unless set explicitly; REFUSED
+#                                outright when combined with --push -- the
+#                                table must never be baked into a
+#                                pushed/public image.
 #
 # --use-wheels <tag>: skip compiling flashinfer/vllm/b12x entirely, download
 #   the release published by .github/workflows/wheels-release.yml instead
@@ -46,6 +54,31 @@ for i in "${!args[@]}"; do
         USE_WHEELS="${args[$((i+1))]:?--use-wheels requires a release tag}"
     fi
 done
+
+# The MTP draft-vocab table (draft_vocab_mia47k.pt) is AGPL and must never be
+# baked into a pushed/public image. Default to an empty placeholder (the
+# Dockerfile's runner stage does "COPY --from=draft_vocab
+# draft_vocab_mia47k.pt ...", so the file must exist by that exact name, just
+# with no real content) in a throwaway mktemp dir -- never a hardcoded
+# dgx-01-only path (build-image-from-wheels run 35465224948 failed on the
+# hosted runner precisely because that path doesn't exist there). Only use a
+# real table dir when the caller explicitly sets DRAFT_VOCAB_DIR, and refuse
+# outright if that's combined with --push.
+resolve_draft_vocab_dir() {
+    if [ "$PUSH" = "1" ] && [ -n "${DRAFT_VOCAB_DIR:-}" ]; then
+        echo "Refusing: DRAFT_VOCAB_DIR is set but --push was requested -- the MTP" >&2
+        echo "draft-vocab table is AGPL and must never be baked into a pushed/public image." >&2
+        exit 1
+    fi
+    if [ "$PUSH" != "1" ] && [ -n "${DRAFT_VOCAB_DIR:-}" ]; then
+        echo "$DRAFT_VOCAB_DIR"
+        return
+    fi
+    local d
+    d="$(mktemp -d)"
+    : > "$d/draft_vocab_mia47k.pt"
+    echo "$d"
+}
 
 if [ -n "$USE_WHEELS" ]; then
     REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,17 +127,7 @@ gpu_arch: 12.1a
 base_image: ${BASE_IMAGE:-unknown}
 EOF
 
-    # ponytail: real MTP draft-vocab weights (draft_vocab_mia47k.pt) only
-    # exist on dgx-01 (see build-image-hosted.yml's identical placeholder);
-    # an empty placeholder satisfies the Dockerfile's COPY --from=draft_vocab
-    # everywhere else (e.g. the hosted runner, which failed with "stat
-    # .../draft-vocab: no such file or directory" without it). Add a real
-    # fetch here if a --use-wheels build ever needs to serve MTP.
-    DRAFT_VOCAB_DIR="${BUILD_ROOT}/draft-vocab"
-    if [ ! -f "$DRAFT_VOCAB_DIR/draft_vocab_mia47k.pt" ]; then
-        mkdir -p "$DRAFT_VOCAB_DIR"
-        : > "$DRAFT_VOCAB_DIR/draft_vocab_mia47k.pt"
-    fi
+    DRAFT_VOCAB_CTX_DIR="$(resolve_draft_vocab_dir)"
 
     RUNNER_IMAGE_TAG="spark-vllm-b12x:runner-${TAG}"
     echo "== docker build (runner stage only, from downloaded wheels, b12x install skipped -- installed via overlay next) =="
@@ -117,7 +140,7 @@ EOF
         --build-arg "B12X_REPO=" \
         --build-context "flashinfer_wheels=${FI_DIR}" \
         --build-context "vllm_wheels=${VW_DIR}" \
-        --build-context "draft_vocab=${DRAFT_VOCAB_DIR}" \
+        --build-context "draft_vocab=${DRAFT_VOCAB_CTX_DIR}" \
         -f Dockerfile . )
 
     IMAGE_TAG="spark-vllm-b12x:${TAG}"
@@ -330,6 +353,7 @@ echo "== 4c. docker build (direct -- build-and-copy.sh's --exp-b12x refuses --vl
 # source-context mechanism build-and-copy.sh uses for --vllm-source-dir, which
 # --exp-b12x's own CLI validation forbids combining -- so we call docker build
 # directly instead of going through build-and-copy.sh.
+DRAFT_VOCAB_CTX_DIR="$(resolve_draft_vocab_dir)"
 BUILD_ARGS=(
     --build-arg "TORCH_VERSION=2.13.0"
     --build-arg "TORCHVISION_VERSION=0.28.0"
@@ -344,7 +368,7 @@ BUILD_ARGS=(
     --build-context "vllm_source=${VLLM_SRC}"
     --build-context "flashinfer_wheels=${FI_DIR}"
     --build-context "vllm_wheels=${VW_DIR}"
-    --build-context "draft_vocab=${BUILD_ROOT}/draft-vocab"
+    --build-context "draft_vocab=${DRAFT_VOCAB_CTX_DIR}"
 )
 if [ "$B12X_LOCAL_SOURCE" = "1" ]; then
     BUILD_ARGS+=(--build-arg "B12X_SOURCE_MODE=local" --build-context "b12x_source=${B12X_SRC}")
