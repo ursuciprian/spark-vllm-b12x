@@ -48,11 +48,21 @@ jobs:
       - name: Build flashinfer wheels
         run: |
           mkdir -p "${{ github.workspace }}/wheels/flashinfer"
-          bash ci/build-stage.sh flashinfer-export \
-            --build-arg "BUILD_JOBS=4" \
-            --cache-from "type=registry,ref=${CACHE_REPO}:flashinfer" \
-            --cache-to "type=registry,ref=${CACHE_REPO}:flashinfer,mode=max" \
-            --output "type=local,dest=${{ github.workspace }}/wheels/flashinfer"
+          # flashinfer's cubin download (artifacts.py, NVIDIA CDN) is flaky
+          # under GitHub-hosted runner IPs -- retry the whole buildx step;
+          # the registry cache makes completed layers/cubins free on retry.
+          for attempt in 1 2 3; do
+            if bash ci/build-stage.sh flashinfer-export \
+                --build-arg "BUILD_JOBS=4" \
+                --cache-from "type=registry,ref=${CACHE_REPO}:flashinfer" \
+                --cache-to "type=registry,ref=${CACHE_REPO}:flashinfer,mode=max" \
+                --output "type=local,dest=${{ github.workspace }}/wheels/flashinfer"; then
+              break
+            fi
+            echo "flashinfer-export attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then echo "giving up after 3 attempts" >&2; exit 1; fi
+            sleep 60
+          done
       - run: df -h /; free -g; ls -la wheels/flashinfer
       - run: docker logout ghcr.io
         if: always()
@@ -84,6 +94,10 @@ jobs:
           # original cwd, so the patch path must be absolute (build.sh hits
           # the same gotcha and works around it via an absolute PATCH_DIR).
           for p in "${{ github.workspace }}/patches"/vllm-*.patch; do
+            if git -C /tmp/vllm-src apply --reverse --check "$p" 2>/dev/null; then
+              echo "already applied (present as a commit on $VLLM_REF), skipping: $p"
+              continue
+            fi
             echo "applying $p"
             git -C /tmp/vllm-src apply --check "$p"
             git -C /tmp/vllm-src apply "$p"

@@ -56,6 +56,14 @@ vLLM fork's own history in a way CI can apply automatically, plus notes on
 every mod-to-source translation done for this build in
 `patches/README.md`.
 
+**`patches/` is only for building from an upstream ref that doesn't have the
+change yet.** Once a patch is merged into a fork branch (`dgx-spark`, etc.) as
+a real commit, applying it again would fail — every caller (`build.sh`,
+`ci/wheels_release/build_bundle.sh`, `build-image-hosted.yml`) checks
+`git apply --reverse --check` first and skips a patch that's already present,
+so the same `patches/*.patch` files work unmodified whether the target ref
+already carries the commit or not.
+
 ## How the recipes consume this
 
 The [qwen3.8-flash-next-dgx-spark-tp-2](https://github.com/ursuciprian/qwen3.8-flash-next-dgx-spark-tp-2)

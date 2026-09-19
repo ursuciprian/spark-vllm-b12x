@@ -50,7 +50,15 @@ git -C "$VLLM_SRC" fetch --quiet origin "$VLLM_REF"
 git -C "$VLLM_SRC" checkout --quiet FETCH_HEAD
 shopt -s nullglob
 for p in "$REPO_ROOT"/patches/vllm-*.patch; do
-    git -C "$VLLM_SRC" apply --check "$p" && git -C "$VLLM_SRC" apply "$p"
+    if git -C "$VLLM_SRC" apply --reverse --check "$p" 2>/dev/null; then
+        echo "already applied (present as a commit on the branch), skipping: $p"
+    elif git -C "$VLLM_SRC" apply --check "$p" 2>/dev/null; then
+        echo "applying $p"
+        git -C "$VLLM_SRC" apply "$p"
+    else
+        echo "patch does not apply forward or reverse -- source tree has diverged: $p" >&2
+        exit 1
+    fi
 done
 shopt -u nullglob
 if [ -n "$(git -C "$VLLM_SRC" status --porcelain)" ]; then

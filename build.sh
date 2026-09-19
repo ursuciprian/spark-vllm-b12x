@@ -158,17 +158,25 @@ B12X_COMMIT_PRE="$(git -C "$B12X_SRC" rev-parse HEAD)"
 echo "vllm tip:  $VLLM_COMMIT ($VLLM_REPO@$VLLM_REF)"
 echo "b12x tip:  $B12X_COMMIT_PRE ($B12X_REPO@$B12X_REF)"
 
-echo "== 2. apply patches (if any) =="
+echo "== 2. apply patches (if any; skip any already present as a real commit on the fork branch) =="
+apply_patch_if_needed() {
+    local src="$1" p="$2"
+    if git -C "$src" apply --reverse --check "$p" 2>/dev/null; then
+        echo "already applied (present as a commit on the branch), skipping: $p"
+    elif git -C "$src" apply --check "$p" 2>/dev/null; then
+        echo "applying $p"
+        git -C "$src" apply "$p"
+    else
+        echo "patch does not apply forward or reverse -- source tree has diverged: $p" >&2
+        exit 1
+    fi
+}
 shopt -s nullglob
 for p in "$PATCH_DIR"/vllm-*.patch; do
-    echo "applying $p to vllm"
-    git -C "$VLLM_SRC" apply --check "$p"
-    git -C "$VLLM_SRC" apply "$p"
+    apply_patch_if_needed "$VLLM_SRC" "$p"
 done
 for p in "$PATCH_DIR"/b12x-*.patch; do
-    echo "applying $p to b12x"
-    git -C "$B12X_SRC" apply --check "$p"
-    git -C "$B12X_SRC" apply "$p"
+    apply_patch_if_needed "$B12X_SRC" "$p"
 done
 shopt -u nullglob
 
