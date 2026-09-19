@@ -149,7 +149,7 @@ B12X_BASE_TAG="spark-vllm-base:${TAG}"
 B12X_WHEEL_DIR="$BUILD_ROOT/.wheel-cache/b12x"
 rm -rf "$B12X_WHEEL_DIR"; mkdir -p "$B12X_WHEEL_DIR"
 docker run --rm \
-    -v "$B12X_SRC:/src:ro" \
+    -v "$B12X_SRC:/src" \
     -v "$B12X_WHEEL_DIR:/wheelhouse" \
     -w /src \
     "$B12X_BASE_TAG" \
