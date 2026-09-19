@@ -93,7 +93,21 @@ jobs:
           # git -C resolves relative paths against ITS target dir, not the
           # original cwd, so the patch path must be absolute (build.sh hits
           # the same gotcha and works around it via an absolute PATCH_DIR).
+          # This clones our own fork, which carries these patches as commits
+          # -- always skip (see build.sh's patch_already_carried()/marker
+          # convention for the full explanation; APPLY_PATCHES=1 forces it).
+          if [ "${APPLY_PATCHES:-0}" != "1" ]; then
+            echo "cloning our fork (carries patches as commits) -- skipping patches/vllm-*.patch (set APPLY_PATCHES=1 to force)"
+          else
           for p in "${{ github.workspace }}/patches"/vllm-*.patch; do
+            marker="$p.marker"
+            if [ -f "$marker" ]; then
+              rule="$(cat "$marker")"; mpath="${rule%%:*}"; needle="${rule#*:}"
+              if [ -f "/tmp/vllm-src/$mpath" ] && grep -q -- "$needle" "/tmp/vllm-src/$mpath"; then
+                echo "marker matched ($rule), skipping: $p"
+                continue
+              fi
+            fi
             if git -C /tmp/vllm-src apply --reverse --check "$p" 2>/dev/null; then
               echo "already applied (present as a commit on $VLLM_REF), skipping: $p"
               continue
@@ -102,6 +116,7 @@ jobs:
             git -C /tmp/vllm-src apply --check "$p"
             git -C /tmp/vllm-src apply "$p"
           done
+          fi
           shopt -u nullglob
           if [ -n "$(git -C /tmp/vllm-src status --porcelain)" ]; then
             git -C /tmp/vllm-src -c user.email=ci@localhost -c user.name=ci commit -aqm "ci: carried source patches (build-stage-hosted)"

@@ -48,18 +48,37 @@ mkdir -p "$(dirname "$VLLM_SRC")"
 [ -d "$VLLM_SRC/.git" ] || git clone --quiet "$VLLM_REPO" "$VLLM_SRC"
 git -C "$VLLM_SRC" fetch --quiet origin "$VLLM_REF"
 git -C "$VLLM_SRC" checkout --quiet FETCH_HEAD
+# See build.sh's patch_already_carried()/apply_patch_if_needed() for the
+# full explanation: a "<patch>.marker" file ("<path>:<grep-string>") flags a
+# patch as already carried when the fork folds it into a commit that also
+# touches nearby lines, so neither forward nor reverse apply cleanly.
+patch_already_carried() {
+    local src="$1" p="$2" marker="$p.marker"
+    [ -f "$marker" ] || return 1
+    local rule path needle
+    rule="$(cat "$marker")"
+    path="${rule%%:*}"
+    needle="${rule#*:}"
+    [ -f "$src/$path" ] && grep -q -- "$needle" "$src/$path"
+}
 shopt -s nullglob
-for p in "$REPO_ROOT"/patches/vllm-*.patch; do
-    if git -C "$VLLM_SRC" apply --reverse --check "$p" 2>/dev/null; then
-        echo "already applied (present as a commit on the branch), skipping: $p"
-    elif git -C "$VLLM_SRC" apply --check "$p" 2>/dev/null; then
-        echo "applying $p"
-        git -C "$VLLM_SRC" apply "$p"
-    else
-        echo "patch does not apply forward or reverse -- source tree has diverged: $p" >&2
-        exit 1
-    fi
-done
+if [[ "$VLLM_REPO" == *"ursuciprian/vllm"* ]] && [ "${APPLY_PATCHES:-0}" != "1" ]; then
+    echo "VLLM_REPO is our fork (carries patches as commits) -- skipping patches/vllm-*.patch (set APPLY_PATCHES=1 to force)"
+else
+    for p in "$REPO_ROOT"/patches/vllm-*.patch; do
+        if patch_already_carried "$VLLM_SRC" "$p"; then
+            echo "marker matched ($(cat "$p.marker")), skipping: $p"
+        elif git -C "$VLLM_SRC" apply --reverse --check "$p" 2>/dev/null; then
+            echo "already applied (reverse-check matched), skipping: $p"
+        elif git -C "$VLLM_SRC" apply --check "$p" 2>/dev/null; then
+            echo "applying $p"
+            git -C "$VLLM_SRC" apply "$p"
+        else
+            echo "patch does not apply forward or reverse, and no marker file matched -- source tree has diverged: $p" >&2
+            exit 1
+        fi
+    done
+fi
 shopt -u nullglob
 if [ -n "$(git -C "$VLLM_SRC" status --porcelain)" ]; then
     git -C "$VLLM_SRC" -c user.email=ci@localhost -c user.name=ci commit -aqm "ci: carried source patches (wheels-release)"

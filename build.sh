@@ -158,26 +158,52 @@ B12X_COMMIT_PRE="$(git -C "$B12X_SRC" rev-parse HEAD)"
 echo "vllm tip:  $VLLM_COMMIT ($VLLM_REPO@$VLLM_REF)"
 echo "b12x tip:  $B12X_COMMIT_PRE ($B12X_REPO@$B12X_REF)"
 
-echo "== 2. apply patches (if any; skip any already present as a real commit on the fork branch) =="
+echo "== 2. apply patches (if any; skip any already carried by the source branch) =="
+# A patch can be carried by the target ref either byte-identically (git apply
+# --reverse --check succeeds) or as a hand-folded commit that also touches
+# nearby lines (reverse/forward both fail -- e.g. dgx-spark's 77bdd107 folds
+# the MTP draft-vocab patch together with unrelated device-fix edits). For
+# the latter case a "<patch>.marker" file ("<path>:<grep-string>") names a
+# feature marker to grep for in the target tree; if present, the patch is
+# considered already carried regardless of whether it applies cleanly.
+patch_already_carried() {
+    local src="$1" p="$2" marker="$p.marker"
+    [ -f "$marker" ] || return 1
+    local rule path needle
+    rule="$(cat "$marker")"
+    path="${rule%%:*}"
+    needle="${rule#*:}"
+    [ -f "$src/$path" ] && grep -q -- "$needle" "$src/$path"
+}
 apply_patch_if_needed() {
     local src="$1" p="$2"
-    if git -C "$src" apply --reverse --check "$p" 2>/dev/null; then
-        echo "already applied (present as a commit on the branch), skipping: $p"
+    if patch_already_carried "$src" "$p"; then
+        echo "marker matched ($(cat "$p.marker")), skipping: $p"
+    elif git -C "$src" apply --reverse --check "$p" 2>/dev/null; then
+        echo "already applied (reverse-check matched), skipping: $p"
     elif git -C "$src" apply --check "$p" 2>/dev/null; then
         echo "applying $p"
         git -C "$src" apply "$p"
     else
-        echo "patch does not apply forward or reverse -- source tree has diverged: $p" >&2
+        echo "patch does not apply forward or reverse, and no marker file matched -- source tree has diverged: $p" >&2
         exit 1
     fi
 }
 shopt -s nullglob
-for p in "$PATCH_DIR"/vllm-*.patch; do
-    apply_patch_if_needed "$VLLM_SRC" "$p"
-done
-for p in "$PATCH_DIR"/b12x-*.patch; do
-    apply_patch_if_needed "$B12X_SRC" "$p"
-done
+if [[ "$VLLM_REPO" == *"ursuciprian/vllm"* ]] && [ "${APPLY_PATCHES:-0}" != "1" ]; then
+    echo "VLLM_REPO is our fork (carries patches as commits) -- skipping patches/vllm-*.patch (set APPLY_PATCHES=1 to force)"
+else
+    for p in "$PATCH_DIR"/vllm-*.patch; do
+        apply_patch_if_needed "$VLLM_SRC" "$p"
+    done
+fi
+if [[ "$B12X_REPO" == *"ursuciprian/b12x"* ]] && [ "${APPLY_PATCHES:-0}" != "1" ]; then
+    echo "B12X_REPO is our fork (carries patches as commits) -- skipping patches/b12x-*.patch (set APPLY_PATCHES=1 to force)"
+else
+    for p in "$PATCH_DIR"/b12x-*.patch; do
+        apply_patch_if_needed "$B12X_SRC" "$p"
+    done
+fi
 shopt -u nullglob
 
 # vLLM's commit id is asserted against VLLM_SOURCE_COMMIT inside the Dockerfile
