@@ -94,6 +94,18 @@ gpu_arch: 12.1a
 base_image: ${BASE_IMAGE:-unknown}
 EOF
 
+    # ponytail: real MTP draft-vocab weights (draft_vocab_mia47k.pt) only
+    # exist on dgx-01 (see build-image-hosted.yml's identical placeholder);
+    # an empty placeholder satisfies the Dockerfile's COPY --from=draft_vocab
+    # everywhere else (e.g. the hosted runner, which failed with "stat
+    # .../draft-vocab: no such file or directory" without it). Add a real
+    # fetch here if a --use-wheels build ever needs to serve MTP.
+    DRAFT_VOCAB_DIR="${BUILD_ROOT}/draft-vocab"
+    if [ ! -f "$DRAFT_VOCAB_DIR/draft_vocab_mia47k.pt" ]; then
+        mkdir -p "$DRAFT_VOCAB_DIR"
+        : > "$DRAFT_VOCAB_DIR/draft_vocab_mia47k.pt"
+    fi
+
     RUNNER_IMAGE_TAG="spark-vllm-b12x:runner-${TAG}"
     echo "== docker build (runner stage only, from downloaded wheels, b12x install skipped -- installed via overlay next) =="
     ( cd "$WORKDIR" && docker build -t "$RUNNER_IMAGE_TAG" \
@@ -105,7 +117,7 @@ EOF
         --build-arg "B12X_REPO=" \
         --build-context "flashinfer_wheels=${FI_DIR}" \
         --build-context "vllm_wheels=${VW_DIR}" \
-        --build-context "draft_vocab=${BUILD_ROOT}/draft-vocab" \
+        --build-context "draft_vocab=${DRAFT_VOCAB_DIR}" \
         -f Dockerfile . )
 
     IMAGE_TAG="spark-vllm-b12x:${TAG}"
