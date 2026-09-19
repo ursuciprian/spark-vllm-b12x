@@ -153,7 +153,7 @@ docker run --rm \
     -v "$B12X_WHEEL_DIR:/wheelhouse" \
     -w /src \
     "$B12X_BASE_TAG" \
-    bash -lc 'python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
+    bash -lc 'python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
 echo "$B12X_COMMIT" > "$B12X_WHEEL_DIR/.b12x-source-commit"
 
 echo "== 6. bundle each wheel dir as <name>-cu134-<sha7>.tar.zst + .sha256 =="

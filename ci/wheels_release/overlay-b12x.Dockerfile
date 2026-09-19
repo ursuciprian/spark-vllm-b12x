@@ -5,5 +5,5 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 COPY --from=b12x_wheel /*.whl /tmp/b12x-wheels/
-RUN python -m pip install --no-deps --force-reinstall /tmp/b12x-wheels/b12x-*.whl && \
+RUN python3 -m pip install --no-deps --force-reinstall /tmp/b12x-wheels/b12x-*.whl && \
     rm -rf /tmp/b12x-wheels
