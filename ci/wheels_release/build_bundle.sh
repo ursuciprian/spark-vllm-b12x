@@ -124,13 +124,23 @@ git -C "$B12X_SRC" checkout --quiet FETCH_HEAD
 B12X_COMMIT="$(git -C "$B12X_SRC" rev-parse HEAD)"
 B12X_SHORT_SHA="$(git -C "$B12X_SRC" rev-parse --short=7 HEAD)"
 
-# Build the "base" stage (not just `grep FROM`, which returns the literal
-# unresolved "${CUDA_IMAGE}" ARG reference and breaks `docker run` -- see
-# wheels-release run 35456233104) so the b12x wheel is built against the same
-# torch/CUDA env the final image uses; "base" already has torch installed
-# (Dockerfile line ~81) so no separate builder stage is needed.
+# Resolve CUDA_IMAGE from the pinned Dockerfile's ARG default rather than
+# grepping the runner stage's raw "FROM ${CUDA_IMAGE} AS runner" line, which
+# returns the literal unresolved ARG reference and breaks `docker run` (see
+# wheels-release run 35456233104: "invalid reference format: repository name
+# (library/${CUDA_IMAGE}) must be lowercase"). Allow an env override; fail
+# fast rather than let an empty value silently reach docker build/run.
+CUDA_IMAGE="${CUDA_IMAGE:-$(sed -nE 's/^ARG CUDA_IMAGE=(.*)$/\1/p' "$WORKDIR/Dockerfile" | head -1)}"
+: "${CUDA_IMAGE:?could not resolve ARG CUDA_IMAGE from $WORKDIR/Dockerfile and no CUDA_IMAGE env override set}"
+echo "CUDA_IMAGE resolved to: $CUDA_IMAGE"
+
+# Build the "base" stage (not the bare CUDA_IMAGE) so the b12x wheel is built
+# against the same torch/CUDA env the final image uses; "base" already
+# installs torch (Dockerfile ~line 81) so no separate builder stage is
+# needed, and its own FROM ${CUDA_IMAGE} is resolved by docker build itself.
 B12X_BASE_TAG="spark-vllm-base:${TAG}"
 ( cd "$WORKDIR" && docker build --target base -t "$B12X_BASE_TAG" \
+    --build-arg "CUDA_IMAGE=${CUDA_IMAGE}" \
     --build-arg "TORCH_VERSION=2.13.0" \
     --build-arg "TORCHVISION_VERSION=0.28.0" \
     --build-arg "TORCHAUDIO_VERSION=2.11.0" \
@@ -143,7 +153,7 @@ docker run --rm \
     -v "$B12X_WHEEL_DIR:/wheelhouse" \
     -w /src \
     "$B12X_BASE_TAG" \
-    bash -lc 'python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
+    bash -lc 'python3 -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
 echo "$B12X_COMMIT" > "$B12X_WHEEL_DIR/.b12x-source-commit"
 
 echo "== 6. bundle each wheel dir as <name>-cu134-<sha7>.tar.zst + .sha256 =="
