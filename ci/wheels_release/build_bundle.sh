@@ -116,8 +116,22 @@ else
 fi
 
 echo "== 5. b12x wheel: pure 'pip wheel', JIT-compiled kernels so no CUDA toolchain build needed (see ci/lil_wheels pattern) =="
-B12X_SRC="$BUILD_ROOT/.src/b12x-wheel"
-rm -rf "$B12X_SRC"
+# A fresh mktemp -d per run (not a fixed path under .src/) so nothing persists
+# across runs to go stale/root-owned in the first place. Even so, `rm -rf` as
+# the non-root nvidia runner user (no sudo) can still fail if the wheel
+# build's container ever writes as root again (run 35461873991: bind-mounted
+# build/ and *.egg-info came back root-owned) -- fall back to a throwaway
+# root container to force-remove.
+rm_rf_robust() {
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    rm -rf "$dir" 2>/dev/null && return 0
+    echo "plain rm -rf failed on $dir (likely root-owned leftovers) -- retrying via a root container" >&2
+    docker run --rm -v "$dir:/w" alpine sh -c 'rm -rf /w/* /w/.[!.]* 2>/dev/null; true'
+    rm -rf "$dir"
+}
+B12X_SRC="$(mktemp -d "$BUILD_ROOT/.wheel-cache/b12x-src.XXXXXX")"
+trap 'rm_rf_robust "$B12X_SRC"' EXIT
 git clone --quiet "$B12X_REPO" "$B12X_SRC"
 git -C "$B12X_SRC" fetch --quiet origin "$B12X_REF"
 git -C "$B12X_SRC" checkout --quiet FETCH_HEAD
@@ -148,8 +162,20 @@ B12X_BASE_TAG="spark-vllm-base:${TAG}"
 
 B12X_WHEEL_DIR="$BUILD_ROOT/.wheel-cache/b12x"
 rm -rf "$B12X_WHEEL_DIR"; mkdir -p "$B12X_WHEEL_DIR"
+# Run as the host UID:GID (not root) so anything written into the bind-mounted
+# $B12X_SRC/$B12X_WHEEL_DIR is owned by the runner user and stays deletable
+# without sudo. A non-root UID has no /etc/passwd entry inside the container,
+# so pip/setuptools need an explicit writable HOME (and pip cache dir) --
+# a separate mktemp dir (not inside $B12X_SRC, so it can't end up swept into
+# the wheel's sdist by an over-eager package-data glob), cleaned up with it.
+B12X_HOME="$(mktemp -d "$BUILD_ROOT/.wheel-cache/b12x-home.XXXXXX")"
+trap 'rm_rf_robust "$B12X_SRC"; rm_rf_robust "$B12X_HOME"' EXIT
 docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/home/build \
+    -e PIP_CACHE_DIR=/home/build/pip-cache \
     -v "$B12X_SRC:/src" \
+    -v "$B12X_HOME:/home/build" \
     -v "$B12X_WHEEL_DIR:/wheelhouse" \
     -w /src \
     "$B12X_BASE_TAG" \
