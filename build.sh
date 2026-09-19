@@ -17,6 +17,12 @@
 #   SPARK_VLLM_DOCKER_REF     -- pinned commit (default: 798528a2, 2026-09-16)
 #   DISTRIBUTE_TO             -- if set, ssh host to docker save|ssh|load the image onto
 #   OWNER                     -- ghcr.io namespace for --push (default: ursuciprian)
+#
+# --use-wheels <tag>: skip compiling flashinfer/vllm/b12x entirely, download
+#   the release published by .github/workflows/wheels-release.yml instead
+#   (gh release download, falling back to public-URL curl if gh is
+#   unavailable), verify sha256, and assemble just the runner stage. Much
+#   faster than the full compile path above; keeps that path unchanged.
 set -euo pipefail
 
 BUILD_ROOT="${BUILD_ROOT:-$HOME/GEN-AI/build}"
@@ -32,9 +38,95 @@ PATCH_DIR="${PATCH_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches}"
 WORKDIR="$BUILD_ROOT/spark-vllm-docker"      # our own scratch copy; never touch a checked-out spark-vllm-docker in place
 DATE_TAG="$(date +%Y%m%d)"
 PUSH=0
-for arg in "$@"; do
-    [ "$arg" = "--push" ] && PUSH=1
+USE_WHEELS=""
+args=("$@")
+for i in "${!args[@]}"; do
+    [ "${args[$i]}" = "--push" ] && PUSH=1
+    if [ "${args[$i]}" = "--use-wheels" ]; then
+        USE_WHEELS="${args[$((i+1))]:?--use-wheels requires a release tag}"
+    fi
 done
+
+if [ -n "$USE_WHEELS" ]; then
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    OWNER="${OWNER:-ursuciprian}"
+    REPO="${OWNER}/spark-vllm-b12x"
+    TAG="$USE_WHEELS"
+
+    echo "== --use-wheels $TAG: downloading release assets instead of compiling =="
+    ASSET_DIR="$(mktemp -d)"
+    if command -v gh >/dev/null 2>&1; then
+        gh release download "$TAG" --repo "$REPO" --dir "$ASSET_DIR"
+    else
+        echo "gh not found, falling back to curl against the public release URL"
+        curl -sfL "https://github.com/${REPO}/releases/download/${TAG}/build-metadata.yaml" -o "$ASSET_DIR/build-metadata.yaml"
+        for f in $(curl -sfL "https://github.com/${REPO}/releases/expanded_assets/${TAG}" | grep -oE "${REPO}/releases/download/${TAG}/[^\"']+" | sed 's#.*/##' | sort -u); do
+            curl -sfL "https://github.com/${REPO}/releases/download/${TAG}/${f}" -o "$ASSET_DIR/${f}"
+        done
+    fi
+
+    echo "== verifying downloaded bundle =="
+    python3 "$REPO_ROOT/ci/wheels_release/verify_release_assets.py" --directory "$ASSET_DIR"
+
+    echo "== extracting wheels =="
+    FI_DIR="$BUILD_ROOT/.wheel-cache/flashinfer-from-release"
+    VW_DIR="$BUILD_ROOT/.wheel-cache/vllm-from-release"
+    B12X_WHEEL_DIR="$BUILD_ROOT/.wheel-cache/b12x-from-release"
+    rm -rf "$FI_DIR" "$VW_DIR" "$B12X_WHEEL_DIR"
+    mkdir -p "$FI_DIR" "$VW_DIR" "$B12X_WHEEL_DIR"
+    tar --zstd -xf "$ASSET_DIR"/flashinfer-cu134-*.tar.zst -C "$FI_DIR"
+    tar --zstd -xf "$ASSET_DIR"/vllm-cu134-*.tar.zst -C "$VW_DIR"
+    tar --zstd -xf "$ASSET_DIR"/b12x-cu134-*.tar.zst -C "$B12X_WHEEL_DIR"
+
+    echo "== fresh scratch copy of eugr/spark-vllm-docker, pinned (runner stage only) =="
+    rm -rf "$WORKDIR"
+    git clone "$SPARK_VLLM_DOCKER_REPO" "$WORKDIR"
+    git -C "$WORKDIR" checkout --quiet "$SPARK_VLLM_DOCKER_REF"
+    python3 "$BUILD_ROOT/apply_submodule_fix.py" "$WORKDIR/Dockerfile" 2>/dev/null || python3 "$REPO_ROOT/apply_submodule_fix.py" "$WORKDIR/Dockerfile"
+
+    VLLM_SOURCE_COMMIT="$(grep -oE '[0-9a-f]{40}' "$ASSET_DIR/build-metadata.yaml" | head -1)"
+    BASE_IMAGE="$(grep -m1 '^FROM .* AS runner' "$WORKDIR/Dockerfile" | awk '{print $2}')"
+    cat > "$WORKDIR/build-metadata.yaml" <<EOF
+build_date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+build_script_commit: build.sh --use-wheels
+wheels_release_tag: ${TAG}
+gpu_arch: 12.1a
+base_image: ${BASE_IMAGE:-unknown}
+EOF
+
+    RUNNER_IMAGE_TAG="spark-vllm-b12x:runner-${TAG}"
+    echo "== docker build (runner stage only, from downloaded wheels, b12x install skipped -- installed via overlay next) =="
+    ( cd "$WORKDIR" && docker build -t "$RUNNER_IMAGE_TAG" \
+        --build-arg "TORCH_VERSION=2.13.0" \
+        --build-arg "TORCHVISION_VERSION=0.28.0" \
+        --build-arg "TORCHAUDIO_VERSION=2.11.0" \
+        --build-arg "TORCH_CUDA_ARCH_LIST=12.1a" \
+        --build-arg "FLASHINFER_CUDA_ARCH_LIST=12.1a" \
+        --build-arg "B12X_REPO=" \
+        --build-context "flashinfer_wheels=${FI_DIR}" \
+        --build-context "vllm_wheels=${VW_DIR}" \
+        --build-context "draft_vocab=${BUILD_ROOT}/draft-vocab" \
+        -f Dockerfile . )
+
+    IMAGE_TAG="spark-vllm-b12x:${TAG}"
+    echo "== overlay: install the exact released b12x wheel over the runner image =="
+    docker build -t "$IMAGE_TAG" \
+        --build-arg "BASE_IMAGE=${RUNNER_IMAGE_TAG}" \
+        --build-context "b12x_wheel=${B12X_WHEEL_DIR}" \
+        -f "$REPO_ROOT/ci/wheels_release/overlay-b12x.Dockerfile" "$REPO_ROOT"
+
+    echo "Built $IMAGE_TAG from wheels release $TAG"
+
+    if [ "$PUSH" = "1" ]; then
+        REMOTE_TAG="ghcr.io/${OWNER}/spark-vllm-b12x:${TAG}"
+        docker tag "$IMAGE_TAG" "$REMOTE_TAG"
+        docker push "$REMOTE_TAG"
+        echo "Pushed $REMOTE_TAG"
+    fi
+
+    echo "== done (--use-wheels path) =="
+    exit 0
+fi
 
 if [ "${CONFIRM_BUILD:-0}" != "1" ]; then
     echo "Refusing to run: this is a heavy build (compile, high RAM/disk) on a" >&2
@@ -66,17 +158,25 @@ B12X_COMMIT_PRE="$(git -C "$B12X_SRC" rev-parse HEAD)"
 echo "vllm tip:  $VLLM_COMMIT ($VLLM_REPO@$VLLM_REF)"
 echo "b12x tip:  $B12X_COMMIT_PRE ($B12X_REPO@$B12X_REF)"
 
-echo "== 2. apply patches (if any) =="
+echo "== 2. apply patches (if any; skip any already present as a real commit on the fork branch) =="
+apply_patch_if_needed() {
+    local src="$1" p="$2"
+    if git -C "$src" apply --reverse --check "$p" 2>/dev/null; then
+        echo "already applied (present as a commit on the branch), skipping: $p"
+    elif git -C "$src" apply --check "$p" 2>/dev/null; then
+        echo "applying $p"
+        git -C "$src" apply "$p"
+    else
+        echo "patch does not apply forward or reverse -- source tree has diverged: $p" >&2
+        exit 1
+    fi
+}
 shopt -s nullglob
 for p in "$PATCH_DIR"/vllm-*.patch; do
-    echo "applying $p to vllm"
-    git -C "$VLLM_SRC" apply --check "$p"
-    git -C "$VLLM_SRC" apply "$p"
+    apply_patch_if_needed "$VLLM_SRC" "$p"
 done
 for p in "$PATCH_DIR"/b12x-*.patch; do
-    echo "applying $p to b12x"
-    git -C "$B12X_SRC" apply --check "$p"
-    git -C "$B12X_SRC" apply "$p"
+    apply_patch_if_needed "$B12X_SRC" "$p"
 done
 shopt -u nullglob
 
