@@ -164,12 +164,36 @@ bundle() {
     sha256sum "$archive" | awk -v a="$(basename "$archive")" '{print $1"  "a}' > "$archive.sha256"
     echo "wrote $archive"
 }
-FI_SHORT_SHA="${FLASHINFER_REF:-unpinned}"
-FI_SHORT_SHA="$(echo "$FI_SHORT_SHA" | cut -c1-7)"
-[ -z "$FI_SHORT_SHA" ] && FI_SHORT_SHA="bundled"
+# flashinfer's actual resolved commit is only known inside the docker build
+# (FLASHINFER_REF defaults to the Dockerfile's own ARG, "main", unless we
+# override it, and we don't pass one to the flashinfer-export build above);
+# the export stage writes it to /workspace/wheels/.flashinfer-commit, which
+# flashinfer-export's "COPY --from=flashinfer-builder /workspace/wheels /"
+# carries into FI_DIR -- including on a cache-hit run, since FI_DIR persists
+# across runs from whenever it was last actually built. Fall back to
+# git ls-remote of the pinned ref only if that marker is somehow missing.
+# A non-hex sha7 would silently fail verify_release_assets.py's asset regex
+# (exactly what broke run 35458650343's "unpinned" fallback), so validate.
+if [ -f "$FI_DIR/.flashinfer-commit" ]; then
+    FI_SHORT_SHA="$(cut -c1-7 "$FI_DIR/.flashinfer-commit")"
+else
+    echo ".flashinfer-commit marker missing in $FI_DIR -- falling back to git ls-remote" >&2
+    FI_SHORT_SHA="$(git ls-remote https://github.com/flashinfer-ai/flashinfer.git "${FLASHINFER_REF:-main}" | awk '{print $1}' | head -1 | cut -c1-7)"
+fi
+[[ "$FI_SHORT_SHA" =~ ^[0-9a-f]{7}$ ]] || { echo "could not resolve a valid 7-hex flashinfer sha (got '$FI_SHORT_SHA')" >&2; exit 1; }
+
 bundle flashinfer "$FI_DIR" "$FI_SHORT_SHA"
 bundle vllm "$VW_DIR" "$VLLM_SHORT_SHA"
 bundle b12x "$B12X_WHEEL_DIR" "$B12X_SHORT_SHA"
+
+echo "== 6b. self-check: all 3 archives + sha256 sidecars present before writing metadata/verifying =="
+for c in flashinfer vllm b12x; do
+    n=$(compgen -G "$OUT_DIR/${c}-cu134-*.tar.zst" | wc -l)
+    [ "$n" -eq 1 ] || { echo "expected exactly 1 ${c}-cu134-*.tar.zst in $OUT_DIR, found $n" >&2; exit 1; }
+    archive="$(compgen -G "$OUT_DIR/${c}-cu134-*.tar.zst")"
+    [ -f "$archive.sha256" ] || { echo "missing sidecar: $archive.sha256" >&2; exit 1; }
+done
+echo "all 3 component archives + sha256 sidecars present."
 
 echo "== 7. build-metadata.yaml =="
 cat > "$OUT_DIR/build-metadata.yaml" <<EOF
