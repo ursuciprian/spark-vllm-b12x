@@ -124,14 +124,25 @@ git -C "$B12X_SRC" checkout --quiet FETCH_HEAD
 B12X_COMMIT="$(git -C "$B12X_SRC" rev-parse HEAD)"
 B12X_SHORT_SHA="$(git -C "$B12X_SRC" rev-parse --short=7 HEAD)"
 
-BASE_IMAGE="$(grep -m1 '^FROM .* AS runner' "$WORKDIR/Dockerfile" | awk '{print $2}')"
+# Build the "base" stage (not just `grep FROM`, which returns the literal
+# unresolved "${CUDA_IMAGE}" ARG reference and breaks `docker run` -- see
+# wheels-release run 35456233104) so the b12x wheel is built against the same
+# torch/CUDA env the final image uses; "base" already has torch installed
+# (Dockerfile line ~81) so no separate builder stage is needed.
+B12X_BASE_TAG="spark-vllm-base:${TAG}"
+( cd "$WORKDIR" && docker build --target base -t "$B12X_BASE_TAG" \
+    --build-arg "TORCH_VERSION=2.13.0" \
+    --build-arg "TORCHVISION_VERSION=0.28.0" \
+    --build-arg "TORCHAUDIO_VERSION=2.11.0" \
+    -f Dockerfile . )
+
 B12X_WHEEL_DIR="$BUILD_ROOT/.wheel-cache/b12x"
 rm -rf "$B12X_WHEEL_DIR"; mkdir -p "$B12X_WHEEL_DIR"
 docker run --rm \
     -v "$B12X_SRC:/src:ro" \
     -v "$B12X_WHEEL_DIR:/wheelhouse" \
     -w /src \
-    "$BASE_IMAGE" \
+    "$B12X_BASE_TAG" \
     bash -lc 'python -m pip wheel --no-build-isolation --no-deps --wheel-dir /wheelhouse . && test "$(find /wheelhouse -maxdepth 1 -name "b12x-*.whl" | wc -l)" -eq 1'
 echo "$B12X_COMMIT" > "$B12X_WHEEL_DIR/.b12x-source-commit"
 
