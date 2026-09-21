@@ -1,0 +1,34 @@
+name: Commit hygiene
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for AI attribution
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          PATTERN='Co-Authored-By: Claude|Claude-Session:|Generated with \[Claude Code\]|🤖 Generated with'
+          FAIL=0
+          if git log --format=%B "origin/$BASE_REF..HEAD" | grep -qiE "$PATTERN"; then
+            echo "::error::AI attribution trailer found in a commit message"
+            FAIL=1
+          fi
+          if printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | grep -qiE "$PATTERN"; then
+            echo "::error::AI attribution found in PR title/body"
+            FAIL=1
+          fi
+          exit "$FAIL"
