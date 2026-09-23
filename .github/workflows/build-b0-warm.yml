@@ -1,0 +1,89 @@
+name: build-b0-warm
+
+# Thin warm layer over the B0 image already on the dgx-01 runner:
+# docker/b0-warm from the recipe repo (b12x plan-cache seed + startup
+# bounded-wait patch). Pushes with GITHUB_TOKEN, so no personal credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      recipe_ref:
+        description: "Recipe repo ref holding docker/b0-warm"
+        required: false
+        default: "main"
+      base_image:
+        description: "Local base image on the runner"
+        required: false
+        default: "spark-vllm-b12x:local-20260918-a8333658"
+      tag:
+        description: "Image tag to push"
+        required: false
+        default: "ghcr.io/ursuciprian/spark-vllm-b12x:b0-20260918-a8333658-warm"
+      push:
+        description: "Push the built image to ghcr.io"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: [self-hosted, dgx-spark]
+    env:
+      BASE: ${{ github.event.inputs.base_image }}
+      TAG: ${{ github.event.inputs.tag }}
+    steps:
+      - name: Preflight - refuse while serving
+        run: |
+          if curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/health | grep -q '^200$'; then
+            echo "::error::localhost:8000/health returned 200 (a model is serving on this runner); refusing." >&2
+            exit 1
+          fi
+          docker image inspect "$BASE" --format 'base {{.Id}} created {{.Created}}'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ursuciprian/qwen3.8-flash-next-dgx-spark-tp-2
+          ref: ${{ github.event.inputs.recipe_ref }}
+          path: recipes
+
+      - name: Build
+        working-directory: recipes
+        run: |
+          docker buildx build --load --build-context mods=mods \
+            --build-arg BASE="$BASE" -t "$TAG" docker/b0-warm
+
+      - name: Verify seed, patch, and no AGPL draft_vocab table
+        run: |
+          docker run --rm --entrypoint bash "$TAG" -c '
+            set -e
+            ls -l /opt/b12x-seed/preparation/*.json
+            grep -q b12x_startup_trace /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/b12x_startup.py
+          '
+          hits=$(docker run --rm --entrypoint bash "$TAG" -c 'find / -xdev -type f \( -iname "*draft_vocab*" -o -path "*draft-vocab*" \) 2>/dev/null')
+          if [ -n "$hits" ]; then
+            echo "::error::draft_vocab files found in the image (AGPL table must not be pushed):" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
+          echo "no draft_vocab files in image"
+
+      - name: Docker login
+        if: github.event.inputs.push == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push
+        if: github.event.inputs.push == 'true'
+        run: |
+          docker push "$TAG"
+          docker image inspect "$TAG" --format '{{join .RepoDigests "\n"}}'
+
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io || true
