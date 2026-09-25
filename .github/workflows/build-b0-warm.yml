@@ -1,8 +1,9 @@
 name: build-b0-warm
 
-# Thin warm layer over the B0 image already on the dgx-01 runner:
+# Thin warm layer over a base image already on the dgx-01 runner:
 # docker/b0-warm from the recipe repo (b12x plan-cache seed + startup
-# bounded-wait patch). Pushes with GITHUB_TOKEN, so no personal credentials.
+# bounded-wait patch; the patch skips itself when the base vLLM already
+# carries it). Pushes with GITHUB_TOKEN, so no personal credentials.
 on:
   workflow_dispatch:
     inputs:
@@ -56,7 +57,9 @@ jobs:
       - name: Build
         working-directory: recipes
         run: |
-          docker buildx build --load --build-context mods=mods \
+          # The mods moved to archive/mods; fall back to mods/ for older refs.
+          mods=archive/mods; [ -d "$mods/b12x-startup-boundedwait" ] || mods=mods
+          docker buildx build --load --build-context mods="$mods" \
             --build-arg BASE="$BASE" -t "$TAG" docker/b0-warm
 
       - name: Verify seed, patch, and no AGPL draft_vocab table
