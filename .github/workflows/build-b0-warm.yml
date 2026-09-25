@@ -69,7 +69,10 @@ jobs:
             ls -l /opt/b12x-seed/preparation/*.json
             grep -q b12x_startup_trace /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/b12x_startup.py
           '
-          hits=$(docker run --rm --entrypoint bash "$TAG" -c 'find / -xdev -type f \( -iname "*draft_vocab*" -o -path "*draft-vocab*" \) 2>/dev/null')
+          # build.sh with an empty draft_vocab context leaves a 0-byte placeholder
+          # (/opt/draft-vocab/draft_vocab_mia47k.pt); only non-empty files can
+          # carry the table.
+          hits=$(docker run --rm --entrypoint bash "$TAG" -c 'find / -xdev -type f -size +0 \( -iname "*draft_vocab*" -o -path "*draft-vocab*" \) 2>/dev/null')
           if [ -n "$hits" ]; then
             echo "::error::draft_vocab files found in the image (AGPL table must not be pushed):" >&2
             echo "$hits" >&2
