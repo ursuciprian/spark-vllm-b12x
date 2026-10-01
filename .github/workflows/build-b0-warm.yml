@@ -71,8 +71,9 @@ jobs:
           '
           # build.sh with an empty draft_vocab context leaves a 0-byte placeholder
           # (/opt/draft-vocab/draft_vocab_mia47k.pt); only non-empty files can
-          # carry the table.
-          hits=$(docker run --rm --entrypoint bash "$TAG" -c 'find / -xdev -type f -size +0 \( -iname "*draft_vocab*" -o -path "*draft-vocab*" \) 2>/dev/null')
+          # carry the table. Python source/bytecode is code, not the table: the
+          # vLLM fork's Apache-2.0 qwen3_8_flash_next/draft_vocab.py (b1.4 on) must pass.
+          hits=$(docker run --rm --entrypoint bash "$TAG" -c 'find / -xdev -type f -size +0 \( -iname "*draft_vocab*" -o -path "*draft-vocab*" \) ! -name "*.py" ! -name "*.pyc" 2>/dev/null')
           if [ -n "$hits" ]; then
             echo "::error::draft_vocab files found in the image (AGPL table must not be pushed):" >&2
             echo "$hits" >&2
