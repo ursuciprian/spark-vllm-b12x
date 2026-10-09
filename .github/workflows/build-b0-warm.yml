@@ -19,6 +19,10 @@ on:
         description: "Image tag to push"
         required: false
         default: "ghcr.io/ursuciprian/spark-vllm-b12x:b0-20260918-a8333658-warm"
+      extra_tag:
+        description: "Optional second tag for the same image (release tag, e.g. ghcr.io/ursuciprian/spark-vllm-b12x:2x-v4.0.0)"
+        required: false
+        default: ""
       push:
         description: "Push the built image to ghcr.io"
         type: boolean
@@ -39,6 +43,7 @@ jobs:
     env:
       BASE: ${{ github.event.inputs.base_image }}
       TAG: ${{ github.event.inputs.tag }}
+      EXTRA: ${{ github.event.inputs.extra_tag }}
     steps:
       - name: Preflight - refuse while serving
         run: |
@@ -60,7 +65,7 @@ jobs:
           # The mods moved to archive/mods; fall back to mods/ for older refs.
           mods=archive/mods; [ -d "$mods/b12x-startup-boundedwait" ] || mods=mods
           docker buildx build --load --build-context mods="$mods" \
-            --build-arg BASE="$BASE" -t "$TAG" docker/b0-warm
+            --build-arg BASE="$BASE" -t "$TAG" ${EXTRA:+-t "$EXTRA"} docker/b0-warm
 
       - name: Verify seed, patch, and no AGPL draft_vocab table
         run: |
@@ -89,6 +94,7 @@ jobs:
         if: github.event.inputs.push == 'true'
         run: |
           docker push "$TAG"
+          [ -z "$EXTRA" ] || docker push "$EXTRA"
           docker image inspect "$TAG" --format '{{join .RepoDigests "\n"}}'
 
       - name: Docker logout
