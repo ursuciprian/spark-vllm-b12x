@@ -1,0 +1,42 @@
+name: retag-image
+
+# Adds a tag to an image already on ghcr (for example the release tag 2x-v2.0.0 on a
+# checked build tag). Copies the manifest only, no pull or rebuild, so both tags keep
+# the same digest. Pushes with GITHUB_TOKEN.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Existing tag, e.g. ghcr.io/ursuciprian/spark-vllm-b12x:k73-20261009-21e0b201-d21d7ade-warm"
+        required: true
+      tag:
+        description: "New tag, e.g. ghcr.io/ursuciprian/spark-vllm-b12x:2x-v2.0.0"
+        required: true
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    env:
+      SRC: ${{ github.event.inputs.source }}
+      NEW: ${{ github.event.inputs.tag }}
+    steps:
+      - name: Check inputs
+        run: |
+          for t in "$SRC" "$NEW"; do
+            case "$t" in ghcr.io/ursuciprian/spark-vllm-b12x:*) ;; *) echo "::error::$t is not a spark-vllm-b12x tag" >&2; exit 1 ;; esac
+          done
+      - uses: docker/setup-buildx-action@v3
+      - name: Docker login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Retag
+        run: |
+          docker buildx imagetools create --tag "$NEW" "$SRC"
+          docker buildx imagetools inspect "$SRC" | head -3
+          docker buildx imagetools inspect "$NEW" | head -3
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io || true
