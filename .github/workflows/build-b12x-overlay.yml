@@ -107,9 +107,12 @@ jobs:
               git -C vllm-src checkout -q "$VC" -- tests/v1/executor/test_b12x_startup.py; V=/v/tests/v1/executor/test_b12x_startup.py; fi
           fi
           # one pytest per target under a hard timeout, so a hung test shows up as a named failure, not a cancelled job
+          # gating: our features and their neighbours; info: upstream suites that need a GPU or hang without one
+          # (tests/preparation hit the 15 min cap on CPU, tests/loader fails without CUDA), reported but not gating
           T="/b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py /b/tests/sequence/test_gdn_deferred_checkpoints.py
-             /b/tests/sequence/test_gdn_decode.py /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V"
+             /b/tests/sequence/test_gdn_decode.py /b/tests/test_registry.py /b/tests/test_packaging.py $V"
           T=$(echo $T)   # one line: the list goes into a bash -c for loop
+          I="/b/tests/preparation /b/tests/loader"
           docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/pylib:/pylib:ro" -e PYTHONPATH=/pylib -v "$PWD/b12x-src:/b:ro" ${V:+-v "$PWD/vllm-src:/v:ro"} --entrypoint bash "$TAG" -c "
             set -u; cd /tmp
             python3 -c 'import pytest' 2>/dev/null || { echo 'pytest did not import'; exit 3; }
@@ -120,6 +123,10 @@ jobs:
               timeout -k 10 900 python3 -m pytest -q -p no:cacheprovider --import-mode=append -rs \$t > /tmp/out.txt 2>&1; r=\$?
               echo \"== \$t: exit \$r\"; tail -12 /tmp/out.txt
               case \$r in 0|5) ;; 124|137) bad=\"\$bad \$t(timeout)\" ;; *) bad=\"\$bad \$t(exit \$r)\" ;; esac
+            done
+            for t in $I; do
+              timeout -k 10 300 python3 -m pytest -q -p no:cacheprovider --import-mode=append -rfE \$t > /tmp/out.txt 2>&1; r=\$?
+              echo \"== info \$t: exit \$r\"; grep -E '^(FAILED|ERROR) ' /tmp/out.txt | cut -c1-220 | head -20; tail -1 /tmp/out.txt
             done
             echo \"failed:\${bad:- none}\"; [ -z \"\$bad\" ]"
       - name: Push
