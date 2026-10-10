@@ -20,11 +20,12 @@ RUN set -eux; test -n "$B12X_REF"; d=/tmp/b12x-src; git init -q $d; git -C $d re
     for i in 1 2 3 4 5; do git -C $d fetch -q --depth 1 origin "$B12X_REF" && break; sleep 10; done; \
     git -C $d checkout -q FETCH_HEAD; \
     pins=$(python3 /tmp/cutlass_pins.py $d/pyproject.toml); echo "cutlass pins: $pins"; test -n "$pins"; \
-    uv pip install --no-deps --reinstall $pins; \
-    uv pip install --no-deps --reinstall $d; \
+    uv pip install --no-cache --no-deps --reinstall $pins; \
+    uv pip install --no-cache --no-deps --reinstall $d; \
     git -C $d rev-parse HEAD > /workspace/b12x-source-commit; \
     python3 -c "import importlib.metadata as m, b12x; print('b12x', m.version('b12x'), open('/workspace/b12x-source-commit').read().strip(), 'cutlass-dsl', m.version('nvidia-cutlass-dsl'))"; \
-    rm -rf $d /tmp/cutlass_pins.py /opt/b12x-seed/torch_compile_cache
+    rm -rf $d /tmp/cutlass_pins.py /opt/b12x-seed/torch_compile_cache; \
+    echo "# /workspace/build-metadata.yaml predates this overlay: b12x and CUTLASS DSL are in b12x-source-commit and pip" >> /workspace/build-metadata.yaml || true
 RUN set -eu; [ -n "$VLLM_REF" ] || { echo "no vLLM overlay"; exit 0; }; test -n "$VLLM_BASE"; \
     S=/usr/local/lib/python3.12/dist-packages; test -d $S/vllm; v=/tmp/vllm-src; git init -q $v; \
     git -C $v remote add origin "$VLLM_REPO"; \
@@ -33,6 +34,7 @@ RUN set -eu; [ -n "$VLLM_REF" ] || { echo "no vLLM overlay"; exit 0; }; test -n 
     files=$(git -C $v diff --name-only --diff-filter=AM "$base" "$ref" -- vllm/); \
     gone=$(git -C $v diff --name-only --diff-filter=DR "$base" "$ref" -- vllm/); [ -z "$gone" ] || { echo "deleted/renamed files not supported: $gone"; exit 1; }; \
     for f in $files; do \
-      if git -C $v cat-file -e "$base:$f" 2>/dev/null; then git -C $v show "$base:$f" | cmp -s - "$S/$f" || { echo "$S/$f differs from $base, refusing"; exit 1; }; fi; \
+      if git -C $v cat-file -e "$base:$f" 2>/dev/null; then git -C $v show "$base:$f" | cmp -s - "$S/$f" || { echo "$S/$f differs from $base, refusing"; exit 1; }; \
+      else [ ! -e "$S/$f" ] || { echo "$S/$f exists in the image but not at $base, refusing"; exit 1; }; fi; \
       mkdir -p "$(dirname "$S/$f")"; git -C $v show "$ref:$f" > "$S/$f"; chmod a+r "$S/$f"; echo "vLLM overlay: $f"; done; \
     echo "$ref" > /workspace/vllm-overlay-commit; rm -rf $v

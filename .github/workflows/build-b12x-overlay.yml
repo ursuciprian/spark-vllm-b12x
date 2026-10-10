@@ -54,6 +54,8 @@ jobs:
       TAG: ${{ github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/free-disk
       - name: Check inputs
         run: |
@@ -61,6 +63,14 @@ jobs:
             case "$t" in ghcr.io/ursuciprian/spark-vllm-b12x:*) ;; *) echo "::error::$t is not a spark-vllm-b12x tag" >&2; exit 1 ;; esac
           done
           [ -z "$VLLM_REF" ] || echo "$VLLM_BASE" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::vllm_base must be a full commit" >&2; exit 1; }
+          for r in "$B12X_REF" "$VLLM_REF"; do
+            [ -z "$r" ] || echo "$r" | grep -qE '^[A-Za-z0-9._/][A-Za-z0-9._/-]*$' || { echo "::error::bad ref $r" >&2; exit 1; }
+          done
+          # never overwrite the base or an existing tag (release tags live in this package)
+          [ "$TAG" != "$BASE" ] || { echo "::error::tag equals base_image" >&2; exit 1; }
+          ! docker manifest inspect "$TAG" > /dev/null 2>&1 || { echo "::error::$TAG already exists on ghcr" >&2; exit 1; }
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); echo "disk free ${avail} GB"
+          [ "$avail" -ge 45 ] || { echo "::error::only ${avail} GB free, the base image needs ~45 GB" >&2; exit 1; }
           python3 ci/cutlass_pins.py --selftest; python3 ci/b12x_import_check.py --selftest
       - name: Docker login
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -74,9 +84,10 @@ jobs:
           df -h /
       - name: vLLM to b12x import check
         run: |
-          chk() { docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/ci:/ci:ro" --entrypoint python3 "$1" /ci/b12x_import_check.py /usr/local/lib/python3.12/dist-packages/vllm; }
+          chk() { docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/ci:/ci:ro" --entrypoint python3 "$1" -u /ci/b12x_import_check.py /usr/local/lib/python3.12/dist-packages/vllm; }
           chk "$BASE" > base.txt || true
           chk "$TAG" > new.txt || true
+          for f in base.txt new.txt; do grep -q ' imports checked' $f || { echo "::error::import check did not complete ($f)"; tail -20 $f; exit 1; }; done
           tail -1 base.txt; tail -1 new.txt
           grep -v ' imports checked' base.txt | sed 's/:[0-9]*:/:/' | sort > base.s; grep -v ' imports checked' new.txt | sed 's/:[0-9]*:/:/' | sort > new.s
           echo "== unresolved only in the new image"; comm -13 base.s new.s | tee only-new.txt
@@ -84,17 +95,23 @@ jobs:
       - name: CPU tests (GPU tests skip)
         run: |
           # the image has no pytest: pytest + its two small deps (packaging/pygments come from the image), mounted read-only
-          python3 -m pip install -q --break-system-packages --no-deps --target pylib pytest pluggy iniconfig
-          git clone -q --filter=blob:none https://github.com/ursuciprian/b12x.git b12x-src && git -C b12x-src checkout -q "$B12X_REF"
+          python3 -m pip install -q --break-system-packages --no-deps --target pylib pytest==8.4.2 pluggy==1.6.0 iniconfig==2.1.0
+          # test the exact commits the image carries, not whatever the refs point at now
+          B=$(docker run --rm --entrypoint cat "$TAG" /workspace/b12x-source-commit)
+          git clone -q --filter=blob:none https://github.com/ursuciprian/b12x.git b12x-src && git -C b12x-src checkout -q "$B"
           V=
           if [ -n "$VLLM_REF" ]; then
+            VC=$(docker run --rm --entrypoint cat "$TAG" /workspace/vllm-overlay-commit)
             git clone -q --filter=blob:none --no-checkout https://github.com/ursuciprian/vllm.git vllm-src
-            git -C vllm-src checkout -q "$VLLM_REF" -- tests/v1/executor/test_b12x_startup.py 2>/dev/null && V=/v/tests/v1/executor/test_b12x_startup.py
+            if git -C vllm-src cat-file -e "$VC:tests/v1/executor/test_b12x_startup.py"; then
+              git -C vllm-src checkout -q "$VC" -- tests/v1/executor/test_b12x_startup.py; V=/v/tests/v1/executor/test_b12x_startup.py; fi
           fi
           docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/pylib:/pylib:ro" -e PYTHONPATH=/pylib -v "$PWD/b12x-src:/b:ro" ${V:+-v "$PWD/vllm-src:/v:ro"} --entrypoint bash "$TAG" -c "
             set -u; cd /tmp
-            python3 -c 'import pytest' 2>/dev/null || { echo 'pytest missing in the image'; exit 3; }
-            python3 -m pytest -q -p no:cacheprovider -rs \
+            python3 -c 'import pytest' 2>/dev/null || { echo 'pytest did not import'; exit 3; }
+            ! python3 -c 'import tests' 2>/dev/null || { echo 'a top-level tests package in the image would shadow /b/tests'; exit 3; }
+            # append mode: b12x resolves to the installed package, tests.* to /b
+            python3 -m pytest -q -p no:cacheprovider --import-mode=append -rs \
               /b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py \
               /b/tests/sequence/test_gdn_deferred_checkpoints.py /b/tests/sequence/test_gdn_decode.py \
               /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V 2>&1 | tail -60
