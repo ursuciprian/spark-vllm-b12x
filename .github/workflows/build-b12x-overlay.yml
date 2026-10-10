@@ -106,18 +106,21 @@ jobs:
             if git -C vllm-src cat-file -e "$VC:tests/v1/executor/test_b12x_startup.py"; then
               git -C vllm-src checkout -q "$VC" -- tests/v1/executor/test_b12x_startup.py; V=/v/tests/v1/executor/test_b12x_startup.py; fi
           fi
+          # one pytest per target under a hard timeout, so a hung test shows up as a named failure, not a cancelled job
+          T="/b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py /b/tests/sequence/test_gdn_deferred_checkpoints.py
+             /b/tests/sequence/test_gdn_decode.py /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V"
           docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/pylib:/pylib:ro" -e PYTHONPATH=/pylib -v "$PWD/b12x-src:/b:ro" ${V:+-v "$PWD/vllm-src:/v:ro"} --entrypoint bash "$TAG" -c "
             set -u; cd /tmp
             python3 -c 'import pytest' 2>/dev/null || { echo 'pytest did not import'; exit 3; }
             ! python3 -c 'import tests' 2>/dev/null || { echo 'a top-level tests package in the image would shadow /b/tests'; exit 3; }
-            # append mode: b12x resolves to the installed package, tests.* to /b
-            python3 -m pytest -q -p no:cacheprovider --import-mode=append -rs \
-              /b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py \
-              /b/tests/sequence/test_gdn_deferred_checkpoints.py /b/tests/sequence/test_gdn_decode.py \
-              /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V 2>&1 | tail -60
-            exit \${PIPESTATUS[0]}" || rc=$?
-          echo "pytest exit ${rc:-0}"
-          [ "${rc:-0}" = 0 ] || [ "${rc:-0}" = 5 ] || exit 1
+            bad=
+            for t in $T; do
+              # append mode: b12x resolves to the installed package, tests.* to /b
+              timeout -k 10 900 python3 -m pytest -q -p no:cacheprovider --import-mode=append -rs \$t > /tmp/out.txt 2>&1; r=\$?
+              echo \"== \$t: exit \$r\"; tail -12 /tmp/out.txt
+              case \$r in 0|5) ;; 124|137) bad=\"\$bad \$t(timeout)\" ;; *) bad=\"\$bad \$t(exit \$r)\" ;; esac
+            done
+            echo \"failed:\${bad:- none}\"; [ -z \"\$bad\" ]"
       - name: Push
         if: github.event.inputs.push == 'true'
         run: |
