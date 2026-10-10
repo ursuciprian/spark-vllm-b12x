@@ -1,0 +1,111 @@
+name: build-b12x-overlay
+
+# Thin overlay on an image already on ghcr, built on a GitHub-hosted arm64 runner (never on the Sparks):
+# b12x from a fork ref (+ the CUTLASS DSL it pins), optional vLLM file overlay between two fork commits, baked torch
+# AOT seed removed (ci/overlay-b12x-src.Dockerfile). Before pushing it runs CPU checks inside the image (no GPU):
+#   - every `from b12x... import x` in the installed vLLM resolves (ci/b12x_import_check.py); the base image is checked
+#     the same way and only new failures on the Qwen serving path fail the job
+#   - b12x CPU tests of the ref (GPU tests skip themselves) and, with a vLLM overlay, the vLLM tests it changed
+# Pushes with GITHUB_TOKEN, so no personal credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Image to overlay (ghcr.io/ursuciprian/spark-vllm-b12x:...)"
+        required: false
+        default: "ghcr.io/ursuciprian/spark-vllm-b12x:k73-20261009-21e0b201-d21d7ade-warm"
+      b12x_ref:
+        description: "ursuciprian/b12x branch or full commit"
+        required: true
+      vllm_base:
+        description: "Full commit the base image's vLLM was built from (needed with vllm_ref)"
+        required: false
+        default: "d21d7adede68991170af760a4ae9087edc281e59"
+      vllm_ref:
+        description: "ursuciprian/vllm branch or full commit whose vllm/ changes over vllm_base are copied in (empty: none)"
+        required: false
+        default: ""
+      tag:
+        description: "Tag to push, e.g. ghcr.io/ursuciprian/spark-vllm-b12x:rb-20261010-<b12x>-<vllm>"
+        required: true
+      push:
+        description: "Push the image after the checks pass"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-b12x-overlay
+  cancel-in-progress: false
+
+jobs:
+  overlay:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    env:
+      BASE: ${{ github.event.inputs.base_image }}
+      B12X_REF: ${{ github.event.inputs.b12x_ref }}
+      VLLM_BASE: ${{ github.event.inputs.vllm_base }}
+      VLLM_REF: ${{ github.event.inputs.vllm_ref }}
+      TAG: ${{ github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/free-disk
+      - name: Check inputs
+        run: |
+          for t in "$BASE" "$TAG"; do
+            case "$t" in ghcr.io/ursuciprian/spark-vllm-b12x:*) ;; *) echo "::error::$t is not a spark-vllm-b12x tag" >&2; exit 1 ;; esac
+          done
+          [ -z "$VLLM_REF" ] || echo "$VLLM_BASE" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::vllm_base must be a full commit" >&2; exit 1; }
+          python3 ci/cutlass_pins.py --selftest; python3 ci/b12x_import_check.py --selftest
+      - name: Docker login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build
+        run: |
+          docker pull -q "$BASE"
+          DOCKER_BUILDKIT=1 docker build --progress=plain -f ci/overlay-b12x-src.Dockerfile \
+            --build-arg BASE_IMAGE="$BASE" --build-arg B12X_REF="$B12X_REF" \
+            --build-arg VLLM_BASE="$VLLM_BASE" --build-arg VLLM_REF="$VLLM_REF" -t "$TAG" .
+          docker run --rm --entrypoint bash "$TAG" -c 'cat /workspace/b12x-source-commit; cat /workspace/vllm-overlay-commit 2>/dev/null; pip list 2>/dev/null | grep -iE "^(b12x|nvidia-cutlass-dsl)"; ls /opt/b12x-seed'
+          df -h /
+      - name: vLLM to b12x import check
+        run: |
+          chk() { docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/ci:/ci:ro" --entrypoint python3 "$1" /ci/b12x_import_check.py /usr/local/lib/python3.12/dist-packages/vllm; }
+          chk "$BASE" > base.txt || true
+          chk "$TAG" > new.txt || true
+          tail -1 base.txt; tail -1 new.txt
+          grep -v ' imports checked' base.txt | sed 's/:[0-9]*:/:/' | sort > base.s; grep -v ' imports checked' new.txt | sed 's/:[0-9]*:/:/' | sort > new.s
+          echo "== unresolved only in the new image"; comm -13 base.s new.s | tee only-new.txt
+          if grep -q '^QWEN ' only-new.txt; then echo "::error::new unresolved b12x imports on the Qwen path"; exit 1; fi
+      - name: CPU tests (GPU tests skip)
+        run: |
+          # the image has no pytest: pytest + its two small deps (packaging/pygments come from the image), mounted read-only
+          python3 -m pip install -q --break-system-packages --no-deps --target pylib pytest pluggy iniconfig
+          git clone -q --filter=blob:none https://github.com/ursuciprian/b12x.git b12x-src && git -C b12x-src checkout -q "$B12X_REF"
+          V=
+          if [ -n "$VLLM_REF" ]; then
+            git clone -q --filter=blob:none --no-checkout https://github.com/ursuciprian/vllm.git vllm-src
+            git -C vllm-src checkout -q "$VLLM_REF" -- tests/v1/executor/test_b12x_startup.py 2>/dev/null && V=/v/tests/v1/executor/test_b12x_startup.py
+          fi
+          docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/pylib:/pylib:ro" -e PYTHONPATH=/pylib -v "$PWD/b12x-src:/b:ro" ${V:+-v "$PWD/vllm-src:/v:ro"} --entrypoint bash "$TAG" -c "
+            set -u; cd /tmp
+            python3 -c 'import pytest' 2>/dev/null || { echo 'pytest missing in the image'; exit 3; }
+            python3 -m pytest -q -p no:cacheprovider -rs \
+              /b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py \
+              /b/tests/sequence/test_gdn_deferred_checkpoints.py /b/tests/sequence/test_gdn_decode.py \
+              /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V 2>&1 | tail -60
+            exit \${PIPESTATUS[0]}" || rc=$?
+          echo "pytest exit ${rc:-0}"
+          [ "${rc:-0}" = 0 ] || [ "${rc:-0}" = 5 ] || exit 1
+      - name: Push
+        if: github.event.inputs.push == 'true'
+        run: |
+          docker push -q "$TAG"
+          docker image inspect "$TAG" --format '{{join .RepoDigests "\n"}}'
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io || true
