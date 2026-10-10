@@ -109,6 +109,7 @@ jobs:
           # one pytest per target under a hard timeout, so a hung test shows up as a named failure, not a cancelled job
           T="/b/tests/moe/test_wm_decode_plan.py /b/tests/moe/test_wm_decode.py /b/tests/sequence/test_gdn_deferred_checkpoints.py
              /b/tests/sequence/test_gdn_decode.py /b/tests/preparation /b/tests/loader /b/tests/test_registry.py /b/tests/test_packaging.py $V"
+          T=$(echo $T)   # one line: the list goes into a bash -c for loop
           docker run --rm --network none -e CUDA_VISIBLE_DEVICES= -v "$PWD/pylib:/pylib:ro" -e PYTHONPATH=/pylib -v "$PWD/b12x-src:/b:ro" ${V:+-v "$PWD/vllm-src:/v:ro"} --entrypoint bash "$TAG" -c "
             set -u; cd /tmp
             python3 -c 'import pytest' 2>/dev/null || { echo 'pytest did not import'; exit 3; }
