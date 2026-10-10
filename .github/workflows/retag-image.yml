@@ -1,7 +1,7 @@
 name: retag-image
 
 # Adds a tag to an image already on ghcr (for example the release tag 2x-v2.0.0 on a
-# checked build tag). Copies the manifest only, no pull or rebuild, so both tags keep
+# checked build tag). Copies the manifest only (no index wrapper), no pull or rebuild, so both tags keep
 # the same digest. Pushes with GITHUB_TOKEN.
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Retag
         run: |
-          docker buildx imagetools create --tag "$NEW" "$SRC"
+          docker buildx imagetools create --prefer-index=false --tag "$NEW" "$SRC"
           docker buildx imagetools inspect "$SRC" | head -3
           docker buildx imagetools inspect "$NEW" | head -3
       - name: Docker logout
