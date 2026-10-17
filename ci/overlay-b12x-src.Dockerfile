@@ -7,6 +7,10 @@
 #   seed   removes the baked torch AOT seed: AOT graphs carry b12x plan handles as constants and vLLM's compile key
 #          does not include b12x, so a seed compiled against another b12x must never be loaded. The b12x plan-selection
 #          seed stays; a b12x with another selection-cache schema reads its own file name and simply measures.
+#   FI     optional (FLASHINFER_REF): a FlashInfer source commit installed beside the image's FlashInfer as the side
+#          package flashinfer_k114 (ci/vendor_flashinfer.py: imports, module paths and torch op namespaces renamed,
+#          its `b12x` compatibility package dropped). The image's FlashInfer, its jit-cache and b12x stay as they are;
+#          only code that imports flashinfer_k114 uses it. No pip: no dependency or CUTLASS DSL change.
 # Build context: the repo root.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -15,6 +19,8 @@ ARG B12X_REF
 ARG VLLM_REPO=https://github.com/ursuciprian/vllm.git
 ARG VLLM_BASE=
 ARG VLLM_REF=
+ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
+ARG FLASHINFER_REF=
 COPY ci/cutlass_pins.py /tmp/cutlass_pins.py
 RUN set -eux; test -n "$B12X_REF"; d=/tmp/b12x-src; git init -q $d; git -C $d remote add origin "$B12X_REPO"; \
     for i in 1 2 3 4 5; do git -C $d fetch -q --depth 1 origin "$B12X_REF" && break; sleep 10; done; \
@@ -38,3 +44,10 @@ RUN set -eu; [ -n "$VLLM_REF" ] || { echo "no vLLM overlay"; exit 0; }; test -n 
       else [ ! -e "$S/$f" ] || { echo "$S/$f exists in the image but not at $base, refusing"; exit 1; }; fi; \
       mkdir -p "$(dirname "$S/$f")"; git -C $v show "$ref:$f" > "$S/$f"; chmod a+r "$S/$f"; echo "vLLM overlay: $f"; done; \
     echo "$ref" > /workspace/vllm-overlay-commit; rm -rf $v
+COPY ci/vendor_flashinfer.py /tmp/vendor_flashinfer.py
+RUN set -eu; [ -n "$FLASHINFER_REF" ] || { echo "no FlashInfer side package"; rm -f /tmp/vendor_flashinfer.py; exit 0; }; \
+    S=/usr/local/lib/python3.12/dist-packages; d=/tmp/fi-src; git init -q $d; git -C $d remote add origin "$FLASHINFER_REPO"; \
+    for i in 1 2 3 4 5; do git -C $d fetch -q --depth 1 origin "$FLASHINFER_REF" && break; sleep 10; done; \
+    git -C $d checkout -q FETCH_HEAD; c=$(git -C $d rev-parse HEAD); \
+    python3 /tmp/vendor_flashinfer.py $d $S/flashinfer_k114 $c; chmod -R a+rX $S/flashinfer_k114; \
+    echo "$c" > /workspace/flashinfer-k114-commit; rm -rf $d /tmp/vendor_flashinfer.py

@@ -25,6 +25,10 @@ on:
         description: "ursuciprian/vllm branch or full commit whose vllm/ changes over vllm_base are copied in (empty: none)"
         required: false
         default: ""
+      flashinfer_ref:
+        description: "flashinfer-ai/flashinfer commit installed beside the image's FlashInfer as flashinfer_k114 (empty: none)"
+        required: false
+        default: ""
       tag:
         description: "Tag to push, e.g. ghcr.io/ursuciprian/spark-vllm-b12x:rb-20261010-<b12x>-<vllm>"
         required: true
@@ -51,6 +55,7 @@ jobs:
       B12X_REF: ${{ github.event.inputs.b12x_ref }}
       VLLM_BASE: ${{ github.event.inputs.vllm_base }}
       VLLM_REF: ${{ github.event.inputs.vllm_ref }}
+      FLASHINFER_REF: ${{ github.event.inputs.flashinfer_ref }}
       TAG: ${{ github.event.inputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -63,6 +68,7 @@ jobs:
             case "$t" in ghcr.io/ursuciprian/spark-vllm-b12x:*) ;; *) echo "::error::$t is not a spark-vllm-b12x tag" >&2; exit 1 ;; esac
           done
           [ -z "$VLLM_REF" ] || echo "$VLLM_BASE" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::vllm_base must be a full commit" >&2; exit 1; }
+          [ -z "$FLASHINFER_REF" ] || echo "$FLASHINFER_REF" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::flashinfer_ref must be a full commit" >&2; exit 1; }
           for r in "$B12X_REF" "$VLLM_REF"; do
             [ -z "$r" ] || echo "$r" | grep -qE '^[A-Za-z0-9._/][A-Za-z0-9._/-]*$' || { echo "::error::bad ref $r" >&2; exit 1; }
           done
@@ -71,7 +77,7 @@ jobs:
           ! docker manifest inspect "$TAG" > /dev/null 2>&1 || { echo "::error::$TAG already exists on ghcr" >&2; exit 1; }
           avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9); echo "disk free ${avail} GB"
           [ "$avail" -ge 45 ] || { echo "::error::only ${avail} GB free, the base image needs ~45 GB" >&2; exit 1; }
-          python3 ci/cutlass_pins.py --selftest; python3 ci/b12x_import_check.py --selftest
+          python3 ci/cutlass_pins.py --selftest; python3 ci/b12x_import_check.py --selftest; python3 ci/vendor_flashinfer.py --selftest
       - name: Docker login
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build
@@ -79,7 +85,7 @@ jobs:
           docker pull -q "$BASE"
           DOCKER_BUILDKIT=1 docker build --progress=plain -f ci/overlay-b12x-src.Dockerfile \
             --build-arg BASE_IMAGE="$BASE" --build-arg B12X_REF="$B12X_REF" \
-            --build-arg VLLM_BASE="$VLLM_BASE" --build-arg VLLM_REF="$VLLM_REF" -t "$TAG" .
+            --build-arg VLLM_BASE="$VLLM_BASE" --build-arg VLLM_REF="$VLLM_REF" --build-arg FLASHINFER_REF="$FLASHINFER_REF" -t "$TAG" .
           docker run --rm --entrypoint bash "$TAG" -c 'cat /workspace/b12x-source-commit; cat /workspace/vllm-overlay-commit 2>/dev/null; pip list 2>/dev/null | grep -iE "^(b12x|nvidia-cutlass-dsl)"; ls /opt/b12x-seed'
           df -h /
       - name: vLLM to b12x import check
@@ -92,6 +98,35 @@ jobs:
           grep -v ' imports checked' base.txt | sed 's/:[0-9]*:/:/' | sort > base.s; grep -v ' imports checked' new.txt | sed 's/:[0-9]*:/:/' | sort > new.s
           echo "== unresolved only in the new image"; comm -13 base.s new.s | tee only-new.txt
           if grep -q '^QWEN ' only-new.txt; then echo "::error::new unresolved b12x imports on the Qwen path"; exit 1; fi
+      - name: FlashInfer side package check
+        if: github.event.inputs.flashinfer_ref != ''
+        run: |
+          # both FlashInfers and the real b12x in one process, CPU only: no import or torch op clash, nothing shadowed
+          docker run --rm --network none -e CUDA_VISIBLE_DEVICES= --entrypoint python3 "$TAG" -c '
+          import importlib.metadata as md, os, sys
+          import flashinfer, flashinfer_k114, b12x
+          from flashinfer_k114.fused_moe import (SM12xNvfp4Config, MoELayer, MoEWeightPack, MoEActivationPack, MoEConfig,
+              BackendOptions, ExecutionConfig, ExpertConfig, MoEFinalizeConfig, QuantConfig, QuantFormat, RoutingConfig, SwiGLU)
+          from flashinfer_k114.fused_moe.cute_dsl.blackwell_sm12x import moe_nvfp4_w4a4
+          from flashinfer_k114.fused_moe.utils import get_hybrid_num_tokens_buckets
+          import flashinfer.sampling
+          k = os.path.dirname(flashinfer_k114.__file__)
+          bad = [n for n, m in list(sys.modules.items()) if n.split(".")[0] == "flashinfer" and (getattr(m, "__file__", None) or "").startswith(k)]
+          assert not bad, ("flashinfer modules loaded from the side package", bad[:5])
+          assert flashinfer.__version__ == md.version("flashinfer-python"), flashinfer.__version__
+          assert b12x.__file__.endswith("/dist-packages/b12x/__init__.py") and "_AliasFinder" not in open(b12x.__file__).read(), b12x.__file__
+          assert open("/workspace/flashinfer-k114-commit").read().strip() == os.environ.get("FIREF", flashinfer_k114.__git_commit__)
+          print("flashinfer", flashinfer.__version__, "| flashinfer_k114", flashinfer_k114.__version__, flashinfer_k114.__git_commit__,
+                "| b12x", md.version("b12x"), open("/workspace/b12x-source-commit").read().strip(), "| cutlass-dsl", md.version("nvidia-cutlass-dsl"))
+          '
+          if docker run --rm --entrypoint test "$TAG" -f /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_sm12x_w4a4_moe.py; then
+            docker run --rm --network none -e CUDA_VISIBLE_DEVICES= --entrypoint python3 "$TAG" -c '
+          import vllm.envs as envs
+          from vllm.model_executor.layers.fused_moe.experts import flashinfer_sm12x_w4a4_moe as m
+          from vllm.model_executor.layers.quantization import modelopt
+          assert "VLLM_FI_SM12X_W4A4_MOE" in envs.environment_variables
+          m._fi(); print("vLLM k114 backend module imports flashinfer_k114")'
+          fi
       - name: CPU tests (GPU tests skip)
         run: |
           # the image has no pytest: pytest + its two small deps (packaging/pygments come from the image), mounted read-only
