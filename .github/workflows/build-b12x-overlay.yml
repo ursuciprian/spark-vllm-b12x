@@ -113,7 +113,7 @@ jobs:
           k = os.path.dirname(flashinfer_k114.__file__)
           bad = [n for n, m in list(sys.modules.items()) if n.split(".")[0] == "flashinfer" and (getattr(m, "__file__", None) or "").startswith(k)]
           assert not bad, ("flashinfer modules loaded from the side package", bad[:5])
-          emb = os.path.join(k, "experimental", "b12x")   # FlashInfer's embedded b12x registers b12x:: torch ops
+          emb = os.path.join(k, "experimental", "b12x")   # the embedded FlashInfer b12x registers b12x:: torch ops
           assert not [n for n, m in list(sys.modules.items()) if (getattr(m, "__file__", None) or "").startswith(emb)], "embedded b12x loaded"
           assert flashinfer.__version__ == md.version("flashinfer-python"), flashinfer.__version__
           assert b12x.__file__.endswith("/dist-packages/b12x/__init__.py") and "_AliasFinder" not in open(b12x.__file__).read(), b12x.__file__
