@@ -1,0 +1,123 @@
+name: push-local-image
+
+# Pushes an image that already exists on the dgx-01 runner (built and gated there) to ghcr, no rebuild.
+# Only ds41-tensorfold images with the CUDA prebuild (labels set by docker/build.sh) go to
+# ghcr.io/ursuciprian/ds41-tensorfold tags. Refuses while a model serves or boots on the runner or a GPU lock is held,
+# and holds the DGX pair lock during the push, so a push never competes with a measurement. Pushes with GITHUB_TOKEN,
+# so no personal credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      local_image:
+        description: "Local image on the runner, e.g. ds41-tf:cand4"
+        required: true
+      expect_commit:
+        description: "Engine commit the image must carry (ds41.tf_commit label), full or short, e.g. ee6ff92"
+        required: true
+      tags:
+        description: "Space-separated target tags, e.g. ghcr.io/ursuciprian/ds41-tensorfold:v1.0.0 ghcr.io/ursuciprian/ds41-tensorfold:cand4-ee6ff92"
+        required: true
+      force:
+        description: "Overwrite tags that already exist on ghcr"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: [self-hosted, dgx-spark]
+    timeout-minutes: 120
+    env:
+      SRC: ${{ github.event.inputs.local_image }}
+      EXPECT: ${{ github.event.inputs.expect_commit }}
+      TAGS: ${{ github.event.inputs.tags }}
+      FORCE: ${{ github.event.inputs.force }}
+      PAIR: /home/nvidia/GEN-AI/ds41/pair
+    steps:
+      - name: Per-run Docker config
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+
+      - name: Check inputs and resolve the image
+        run: |
+          set -euf
+          [ -n "$TAGS" ] || { echo "::error::no tags" >&2; exit 1; }
+          for t in $TAGS; do
+            case "$t" in ghcr.io/ursuciprian/ds41-tensorfold:*) ;; *) echo "::error::$t is not a ds41-tensorfold tag" >&2; exit 1 ;; esac
+          done
+          id=$(docker image inspect "$SRC" --format '{{.Id}}')
+          title=$(docker image inspect "$id" --format '{{index .Config.Labels "org.opencontainers.image.title"}}')
+          pre=$(docker image inspect "$id" --format '{{index .Config.Labels "ds41.prebuilt"}}')
+          commit=$(docker image inspect "$id" --format '{{index .Config.Labels "ds41.tf_commit"}}')
+          [ "$title" = ds41-tensorfold ] || { echo "::error::$SRC is not a ds41-tensorfold image (title '$title')" >&2; exit 1; }
+          [ "$pre" = cuda ] || { echo "::error::$SRC has no CUDA prebuild (ds41.prebuilt '$pre')" >&2; exit 1; }
+          case "$EXPECT" in ????????*|???????) ;; *) echo "::error::expect_commit needs at least 7 characters" >&2; exit 1 ;; esac
+          case "$commit" in "$EXPECT"*) ;; *) echo "::error::$SRC carries commit $commit, expected $EXPECT" >&2; exit 1 ;; esac
+          echo "IMAGE_ID=$id" >> "$GITHUB_ENV"
+          echo "source $id commit $commit"
+
+      - name: Preflight - refuse while serving, booting or holding a GPU lock
+        run: |
+          set -euf
+          [ -d "$PAIR" ] || { echo "::error::$PAIR missing; cannot check the pair lock" >&2; exit 1; }
+          for p in 8000 8888; do
+            if curl -s -m 5 -o /dev/null -w '%{http_code}' http://localhost:$p/health | grep -q '^200$'; then
+              echo "::error::localhost:$p serves a model; refusing." >&2; exit 1
+            fi
+          done
+          if docker ps --format '{{.Names}}' | grep -q '^sparkrun'; then
+            echo "::error::a sparkrun container is running; refusing." >&2; exit 1
+          fi
+          for l in "$HOME/GEN-AI/gpu-lock" "$HOME/GEN-AI/gpu-lock-$(hostname | tr -d -)"; do
+            [ -e "$l" ] || continue
+            flock -n -s "$l" true || { echo "::error::a GPU lock is held; refusing." >&2; exit 1; }
+          done
+
+      - name: Take the pair lock
+        run: |
+          ( set -C; echo "push-local-image run $GITHUB_RUN_ID $(date '+%F %T')" > "$PAIR/PAIR.LOCK" ) 2>/dev/null \
+            || { echo "::error::DGX pair lock held; refusing." >&2; exit 1; }
+          echo "LOCK_TAKEN=1" >> "$GITHUB_ENV"
+
+      - name: Docker login
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Refuse existing tags unless forced
+        run: |
+          set -euf
+          [ "$FORCE" = true ] && exit 0
+          for t in $TAGS; do
+            if docker manifest inspect "$t" > /dev/null 2>&1; then
+              echo "::error::$t already exists on ghcr; set force to overwrite." >&2; exit 1
+            fi
+          done
+
+      - name: Tag and push
+        run: |
+          set -euf
+          for t in $TAGS; do docker tag "$IMAGE_ID" "$t"; done
+          for t in $TAGS; do
+            docker push "$t"
+            [ "$(docker image inspect "$t" --format '{{.Id}}')" = "$IMAGE_ID" ] || { echo "::error::$t no longer points at $IMAGE_ID" >&2; exit 1; }
+          done
+          docker image inspect "$IMAGE_ID" --format '{{join .RepoDigests "\n"}}'
+
+      - name: Docker logout
+        if: always() && env.DOCKER_CONFIG != ''
+        run: docker logout ghcr.io || true
+
+      - name: Release the pair lock
+        if: always() && env.LOCK_TAKEN == '1'
+        run: grep -q "^push-local-image run $GITHUB_RUN_ID " "$PAIR/PAIR.LOCK" 2>/dev/null && rm -f "$PAIR/PAIR.LOCK" || true
