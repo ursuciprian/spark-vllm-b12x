@@ -1,0 +1,66 @@
+name: push-local-image
+
+# Pushes an image that already exists on the dgx-01 runner (built and gated there) to ghcr, no rebuild.
+# Only ghcr.io/ursuciprian/ds41-tensorfold tags are accepted. Refuses while a model serves on the runner or while the
+# DGX pair lock is held, so a push never competes with a measurement. Pushes with GITHUB_TOKEN, so no personal
+# credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      local_image:
+        description: "Local image on the runner, e.g. ds41-tf:cand4"
+        required: true
+      tags:
+        description: "Space-separated target tags, e.g. ghcr.io/ursuciprian/ds41-tensorfold:v1.0.0 ghcr.io/ursuciprian/ds41-tensorfold:cand4-ee6ff92"
+        required: true
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: [self-hosted, dgx-spark]
+    env:
+      SRC: ${{ github.event.inputs.local_image }}
+      TAGS: ${{ github.event.inputs.tags }}
+    steps:
+      - name: Check inputs
+        run: |
+          [ -n "$TAGS" ] || { echo "::error::no tags" >&2; exit 1; }
+          for t in $TAGS; do
+            case "$t" in ghcr.io/ursuciprian/ds41-tensorfold:*) ;; *) echo "::error::$t is not a ds41-tensorfold tag" >&2; exit 1 ;; esac
+          done
+          docker image inspect "$SRC" --format 'source {{.Id}} created {{.Created}} tf_commit {{index .Config.Labels "ds41.tf_commit"}}'
+
+      - name: Preflight - refuse while serving or while the pair is locked
+        run: |
+          for p in 8000 8888; do
+            if curl -s -m 5 -o /dev/null -w '%{http_code}' http://localhost:$p/health | grep -q '^200$'; then
+              echo "::error::localhost:$p/health returned 200 (a model is serving on this runner); refusing." >&2
+              exit 1
+            fi
+          done
+          if [ -e "$HOME/GEN-AI/ds41/pair/PAIR.LOCK" ]; then
+            echo "::error::DGX pair lock held: $(head -c 120 "$HOME/GEN-AI/ds41/pair/PAIR.LOCK"); refusing." >&2
+            exit 1
+          fi
+
+      - name: Tag
+        run: for t in $TAGS; do docker tag "$SRC" "$t"; done
+
+      - name: Docker login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push
+        run: |
+          for t in $TAGS; do docker push "$t"; done
+          docker image inspect "$SRC" --format '{{join .RepoDigests "\n"}}'
+
+      - name: Docker logout
+        if: always()
+        run: docker logout ghcr.io || true
