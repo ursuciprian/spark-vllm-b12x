@@ -40,9 +40,11 @@ jobs:
       EXPECT: ${{ github.event.inputs.expect_commit }}
       TAGS: ${{ github.event.inputs.tags }}
       FORCE: ${{ github.event.inputs.force }}
-      DOCKER_CONFIG: ${{ runner.temp }}/docker
       PAIR: /home/nvidia/GEN-AI/ds41/pair
     steps:
+      - name: Per-run Docker config
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/docker" >> "$GITHUB_ENV"
+
       - name: Check inputs and resolve the image
         run: |
           set -euf
@@ -113,7 +115,7 @@ jobs:
           docker image inspect "$IMAGE_ID" --format '{{join .RepoDigests "\n"}}'
 
       - name: Docker logout
-        if: always()
+        if: always() && env.DOCKER_CONFIG != ''
         run: docker logout ghcr.io || true
 
       - name: Release the pair lock
